@@ -891,7 +891,7 @@ def select_latest_declarations(
             latest[key] = item
 
     selected = sorted([*latest.values(), *fct_declarations], key=lambda x: (x.tax_type, x.year, x.month, x.revision))
-    selected_set = set(selected)
+    selected_ids = {id(d) for d in selected}
 
     for decl in declarations:
         period_str = f"Quý {decl.month // 3}" if decl.period_type == "quarter" else f"Tháng {decl.month:02d}"
@@ -899,7 +899,7 @@ def select_latest_declarations(
             period_str = "Cả năm"
         rev_str = "Lần đầu" if decl.revision == 0 else f"Bổ sung L{decl.revision}"
 
-        is_chosen = decl in selected_set
+        is_chosen = id(decl) in selected_ids
         audit_records.append({
             "Tệp": decl.path.name,
             "Định dạng": decl.source_format,
