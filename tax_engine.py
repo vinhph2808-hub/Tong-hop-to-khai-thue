@@ -1132,22 +1132,56 @@ def write_to_excel_openpyxl(
     return output_path
 
 
+VAT_COLUMN_LABELS = {
+    "22": "[22] Thuế GTGT còn được KT kỳ trước chuyển sang",
+    "24": "[24] Giá trị HHDV mua vào",
+    "24a": "[24a] Giá trị HHDV mua vào nhập khẩu",
+    "25": "[25] Thuế GTGT HHDV mua vào được khấu trừ",
+    "26": "[26] HHDV bán ra không chịu thuế GTGT",
+    "29": "[29] HHDV bán ra chịu thuế suất 0%",
+    "30": "[30] HHDV bán ra chịu thuế suất 5%",
+    "31": "[31] Thuế GTGT HHDV bán ra chịu thuế suất 5%",
+    "32": "[32] HHDV bán ra chịu thuế suất 10%",
+    "32a": "[32a] HHDV bán ra không tính thuế",
+    "33": "[33] Thuế GTGT HHDV bán ra chịu thuế suất 10%",
+    "37": "[37] Điều chỉnh giảm thuế GTGT còn được KT kỳ trước",
+    "38": "[38] Điều chỉnh tăng thuế GTGT còn được KT kỳ trước",
+    "42": "[42] Thuế GTGT đề nghị hoàn",
+    "43": "[43] Thuế GTGT còn được KT chuyển kỳ sau",
+}
+
+CIT_LABELS = {
+    "A1": "Tổng lợi nhuận kế toán trước thuế TNDN",
+    "B1": "Điều chỉnh tăng tổng lợi nhuận trước thuế TNDN",
+    "B8": "Chi phí không được trừ khi xác định thu nhập chịu thuế",
+    "B13": "Các khoản điều chỉnh làm giảm lợi nhuận trước thuế",
+    "C3": "Thu nhập tính thuế TNDN",
+    "C4": "Thu nhập tính thuế áp dụng thuế suất 20%",
+    "C9": "Thuế TNDN từ hoạt động SXKD tính theo thuế suất phổ thông",
+    "C10": "Thuế TNDN được miễn, giảm theo quy định",
+    "E": "Số thuế TNDN phải nộp trong kỳ",
+}
+
+
 def generate_summary_dataframes(declarations: list[Declaration]) -> dict[str, pd.DataFrame]:
-    """Tạo các DataFrame thống kê trực quan để hiển thị trên giao diện Web."""
+    """Tạo các DataFrame thống kê trực quan kèm đầy đủ tên nội dung chỉ tiêu để hiển thị trên giao diện Web."""
     dfs: dict[str, pd.DataFrame] = {}
 
     # 1. Bảng GTGT (01/GTGT)
+    vat_order = ("22", "24", "24a", "25", "26", "29", "30", "31", "32", "32a", "33", "37", "38", "42", "43")
     vat_records = []
     for m in range(1, 13):
         row = {"Tháng": f"Tháng {m:02d}"}
         matched = [d for d in declarations if d.tax_type == TAX_VAT and d.month == m]
         if matched:
             d = matched[0]
-            for code in ("22", "24", "25", "26", "29", "30", "32", "32a", "33", "37", "38", "42", "43"):
-                row[f"[{code}]"] = d.values.get(code, 0)
+            for code in vat_order:
+                col_name = VAT_COLUMN_LABELS.get(code, f"[{code}]")
+                row[col_name] = d.values.get(code, 0)
         else:
-            for code in ("22", "24", "25", "26", "29", "30", "32", "32a", "33", "37", "38", "42", "43"):
-                row[f"[{code}]"] = 0
+            for code in vat_order:
+                col_name = VAT_COLUMN_LABELS.get(code, f"[{code}]")
+                row[col_name] = 0
         vat_records.append(row)
     dfs["VAT"] = pd.DataFrame(vat_records)
 
@@ -1156,7 +1190,10 @@ def generate_summary_dataframes(declarations: list[Declaration]) -> dict[str, pd
     for m in range(1, 13):
         matched = [d for d in declarations if d.tax_type == TAX_PIT and d.month == m]
         val = matched[0].values.get("29", 0) if matched else 0
-        pit_records.append({"Tháng": f"Tháng {m:02d}", "Thuế TNCN Phát Sinh [29]": val})
+        pit_records.append({
+            "Tháng": f"Tháng {m:02d}",
+            "[29] Tổng số thuế TNCN đã khấu trừ trong kỳ": val,
+        })
     dfs["PIT"] = pd.DataFrame(pit_records)
 
     # 3. Bảng TNDN (03/TNDN)
@@ -1165,10 +1202,18 @@ def generate_summary_dataframes(declarations: list[Declaration]) -> dict[str, pd
     if matched_cit:
         d = matched_cit[0]
         for code in CIT_INDICATORS:
-            cit_records.append({"Chỉ tiêu": f"[{code}]", "Số tiền (VNĐ)": d.values.get(code, 0)})
+            cit_records.append({
+                "Mã chỉ tiêu": f"[{code}]",
+                "Nội dung chỉ tiêu": CIT_LABELS.get(code, ""),
+                "Số tiền (VNĐ)": d.values.get(code, 0),
+            })
     else:
         for code in CIT_INDICATORS:
-            cit_records.append({"Chỉ tiêu": f"[{code}]", "Số tiền (VNĐ)": 0})
+            cit_records.append({
+                "Mã chỉ tiêu": f"[{code}]",
+                "Nội dung chỉ tiêu": CIT_LABELS.get(code, ""),
+                "Số tiền (VNĐ)": 0,
+            })
     dfs["CIT"] = pd.DataFrame(cit_records)
 
     # 4. Bảng NTNN (01/NTNN)
@@ -1177,7 +1222,12 @@ def generate_summary_dataframes(declarations: list[Declaration]) -> dict[str, pd
         matched = [d for d in declarations if d.tax_type == TAX_FCT and d.month == m]
         c09 = sum(d.values.get("09", 0) for d in matched)
         c13 = sum(d.values.get("13", 0) for d in matched)
-        fct_records.append({"Tháng": f"Tháng {m:02d}", "Chỉ tiêu 09 (GTGT)": c09, "Chỉ tiêu 13 (TNDN)": c13, "Tổng cộng": c09 + c13})
+        fct_records.append({
+            "Tháng": f"Tháng {m:02d}",
+            "[09] Thuế GTGT nhà thầu phải nộp": c09,
+            "[13] Thuế TNDN nhà thầu phải nộp": c13,
+            "Tổng cộng số thuế nhà thầu phải nộp ([09] + [13])": c09 + c13,
+        })
     dfs["FCT"] = pd.DataFrame(fct_records)
 
     return dfs

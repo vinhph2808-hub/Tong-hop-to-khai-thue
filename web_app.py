@@ -38,6 +38,27 @@ def clear_all_data():
     st.session_state["processed_result"] = None
     st.rerun()
 
+def fmt_vnd(x):
+    """Định dạng số theo chuẩn kế toán: dấu chấm '.' phân cách số, không có dấu phẩy ','."""
+    if pd.isna(x) or x is None or x == "":
+        return "0"
+    try:
+        val = float(x)
+        if val == 0:
+            return "0"
+        if val.is_integer():
+            return f"{int(val):,}".replace(",", ".")
+        parts = f"{val:,.2f}".split(".")
+        return parts[0].replace(",", ".") + "." + parts[1]
+    except Exception:
+        return str(x)
+
+def display_styled_dataframe(df: pd.DataFrame):
+    """Hiển thị bảng dữ liệu với định dạng số phân cách dấu chấm '.' chuyên nghiệp."""
+    num_cols = [c for c in df.columns if c not in ("Tháng", "Mã chỉ tiêu", "Nội dung chỉ tiêu", "Chỉ tiêu", "Tên chỉ tiêu")]
+    styler = df.style.format(formatter=fmt_vnd, subset=num_cols)
+    st.dataframe(styler, use_container_width=True)
+
 # Tùy biến CSS giao diện hiện đại, chuyên nghiệp
 st.markdown(
     """
@@ -116,15 +137,6 @@ with st.sidebar:
         clear_all_data()
 
     st.markdown("---")
-    st.info(
-        "**Thứ tự ưu tiên khi trùng kỳ kê khai:**\n"
-        "1. 🥇 **XML:** Nộp qua Thuế điện tử eTax (chính xác tuyệt đối 100%).\n"
-        "2. 🥈 **PDF:** Bản in điện tử / PDF ký số.\n"
-        "3. 🥉 **Hình ảnh / Bản Scan:** Tự động chuyển hình ảnh sang PDF và quét qua OCR.\n\n"
-        "*(Nếu cùng định dạng, tờ khai bổ sung lần sau sẽ tự động thay thế tờ khai lần trước)*"
-    )
-
-    st.markdown("---")
     st.markdown("### 🔍 Bộ lọc kỳ tính thuế:")
     period_mode = st.radio(
         "Chọn chế độ lấy kỳ tờ khai:",
@@ -132,13 +144,6 @@ with st.sidebar:
         format_func=lambda x: "Tất cả các kỳ (Khuyên dùng)" if x == "all" else ("Chỉ lấy tờ khai Tháng" if x == "month" else "Chỉ lấy tờ khai Quý"),
         index=0,
     )
-
-    st.markdown("---")
-    st.markdown("**Các loại tờ khai được hỗ trợ:**")
-    st.markdown("- ✅ **01/GTGT:** Thuế Giá trị gia tăng (chỉ tiêu [22], [24], [25], [32a], [43]...)")
-    st.markdown("- ✅ **05/KK-TNCN & 02/KK-TNCN:** Thuế Thu nhập cá nhân (chỉ tiêu [29]...)")
-    st.markdown("- ✅ **03/TNDN:** Quyết toán thuế Thu nhập doanh nghiệp (chỉ tiêu A1, B1..B13, C3..C10, E)")
-    st.markdown("- ✅ **01/NTNN:** Thuế Nhà thầu nước ngoài (chỉ tiêu 09, 13)")
 
 # Khu vực Upload tập tin có gắn key động để hỗ trợ Clear triệt để
 current_uploader_key = f"uploader_{st.session_state['uploader_key_id']}"
@@ -323,16 +328,16 @@ if st.session_state["processed_result"] is not None:
     ])
 
     with tab_vat:
-        st.dataframe(dfs["VAT"].style.format(precision=0, thousands=","), use_container_width=True)
+        display_styled_dataframe(dfs["VAT"])
 
     with tab_pit:
-        st.dataframe(dfs["PIT"].style.format(precision=0, thousands=","), use_container_width=True)
+        display_styled_dataframe(dfs["PIT"])
 
     with tab_cit:
-        st.dataframe(dfs["CIT"].style.format(precision=0, thousands=","), use_container_width=True)
+        display_styled_dataframe(dfs["CIT"])
 
     with tab_fct:
-        st.dataframe(dfs["FCT"].style.format(precision=0, thousands=","), use_container_width=True)
+        display_styled_dataframe(dfs["FCT"])
 
     with tab_log:
         st.markdown("**Danh sách các tờ khai đã xử lý:**")
