@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 tax_engine.py - Bộ máy trích xuất tờ khai thuế & xuất Excel độc lập đa nền tảng.
-Chạy thuần túy bằng Python (OpenPyXL, PyPDF, pdfplumber, xml.etree).
-Tương thích 100% trên cả Windows, Linux, macOS và Streamlit Cloud!
+Chạy thuần túy bằng Python (OpenPyXL, PyPDF, pdfplumber, xml.etree, RapidOCR).
+Tương thích 100% trên Windows, Linux, macOS và Streamlit Cloud!
+Hỗ trợ ưu tiên định dạng: XML > PDF > Hình ảnh (PNG, JPG, BMP...) chuyển sang PDF/Scan.
 """
 
 from __future__ import annotations
@@ -11,6 +12,8 @@ import datetime
 import os
 import re
 import shutil
+import stat
+import subprocess
 import tempfile
 import unicodedata
 import xml.etree.ElementTree as ET
@@ -26,46 +29,48 @@ from pypdf import PdfReader
 import pdfplumber
 
 # Các hằng số định danh loại thuế
-TAX_VAT = "01/GTGT"
-TAX_PIT = "05/KK-TNCN"
-TAX_PIT_02 = "02/KK-TNCN"
-TAX_CIT = "03/TNDN"
-TAX_FCT = "01/NTNN"
+TAX_VAT = "GTGT"
+TAX_PIT = "TNCN 05/KK"
+TAX_CIT = "TNDN 03/TNDN"
+TAX_FCT = "NTNN 01/NTNN"
 
 # Các chỉ tiêu mẫu biểu
 E343_INDICATORS = (
     "26", "32a", "29", "30", "32", "33", "31",
-    "24", "24a", "25", "38", "37", "42", "43", "22"
+    "24", "24a", "25", "38", "37", "42", "43", "22",
 )
 VAT_INDICATORS = E343_INDICATORS
 
 PIT_INDICATORS = (
     "21", "22", "27", "28", "30", "31", "32",
-    "33", "34", "35", "36", "29"
+    "33", "34", "35", "36", "29",
 )
 
 CIT_INDICATORS = (
-    "A1", "B1", "B8", "B13", "C3", "C4", "C9", "C10", "E"
+    "A1", "B1", "B8", "B13", "C3", "C4", "C9", "C10", "E",
 )
 
 FCT_INDICATORS = ("09", "13")
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+SOURCE_SUFFIXES = {".pdf", ".xml", *IMAGE_SUFFIXES}
 ARCHIVE_SUFFIXES = {".zip", ".rar"}
 
 
 @dataclass
 class Declaration:
     path: Path
-    year: int
     month: int
+    year: int
     revision: int
     values: dict[str, int]
     missing: list[str]
-    note: str = ""
-    period_type: str = "month"
+    modified: float
     tax_type: str = TAX_VAT
-    modified: float = 0.0
+    period_type: str = "month"
+    note: str = ""
+    source_format: str = "PDF"  # XML, PDF, IMAGE, SCAN_PDF
+    priority_rank: int = 2      # XML: 3, PDF: 2, IMAGE/SCAN: 1
 
 
 def fold(text: str) -> str:
@@ -100,49 +105,60 @@ def parse_amount(raw: str) -> int:
     return -value if negative or raw.startswith("-") else value
 
 
-def extract_period(text: str, filename: str) -> tuple[int, int, str] | None:
+def extract_period(text: str, filename: str) -> tuple[int, int] | None:
     source = fold(text + "\n" + filename)
     annual_patterns = [
         r"ky\s*tinh\s*thue.{0,100}?nam\s*(20\d{2})",
         r"nam\s*(20\d{2})\s*(?:tu\s*\d{1,2}/\d{1,2}/\d{4}\s*den|\(tu|tu\s*01/01/)",
     ]
     for pattern in annual_patterns:
-        match = re.search(pattern, source)
+        match = re.search(pattern, source, re.DOTALL)
         if match:
             year = int(match.group(1))
-            return 12, year, "year"
+            return 12, year
 
     quarter_patterns = [
-        r"quy\s*([1-4])\s*(?:nam|/)?\s*(20\d{2})",
-        r"quy\s*([iI]{1,3}|IV)\s*(?:nam|/)?\s*(20\d{2})",
+        r"(?:ky\s*tinh\s*thue.{0,100}?)?quy\s*([1-4])\s*(?:nam|/)?\s*(20\d{2})",
+        r"(?:ky\s*tinh\s*thue.{0,100}?)?quy\s*([iI]{1,3}|IV)\s*(?:nam|/)?\s*(20\d{2})",
+        r"(?:ky\s*tinh\s*thue.{0,100}?)?quy\s*([1-4])\s*ky\s*tinh\s*tu\s*thang\s*\d{1,2}/\s*(20\d{2})",
+        r"(?:ky\s*tinh\s*thue.{0,100}?)?q([1-4])\s*[-_./\s]*(20\d{2})",
     ]
     for pattern in quarter_patterns:
-        match = re.search(pattern, source)
+        match = re.search(pattern, source, re.DOTALL)
         if match:
             q_str = match.group(1).upper()
             q_map = {"1": 1, "2": 2, "3": 3, "4": 4, "I": 1, "II": 2, "III": 3, "IV": 4}
             quarter = q_map.get(q_str, 1)
             year = int(match.group(2))
-            return quarter * 3, year, "quarter"
+            return quarter * 3, year
 
     month_patterns = [
-        r"thang\s*0?(\d{1,2})\s*(?:nam|/)?\s*(20\d{2})",
-        r"ky\s*tinh\s*thue.*?0?(\d{1,2})/(20\d{2})",
+        r"(?:ky\s*tinh\s*thue.{0,100}?)?thang\s*0?(\d{1,2})\s*(?:nam|/)?\s*(20\d{2})",
+        r"(?:ky\s*tinh\s*thue.{0,100}?)?t0?(\d{1,2})\s*[-_./\s]*(20\d{2})",
+        r"(?:ky\s*tinh\s*thue.{0,100}?)?0?(\d{1,2})/(20\d{2})",
+        r"thang\s*0?(\d{1,2})\s*nam\s*(20\d{2})",
     ]
     for pattern in month_patterns:
-        match = re.search(pattern, source)
+        match = re.search(pattern, source, re.DOTALL)
         if match:
             month = int(match.group(1))
             year = int(match.group(2))
             if 1 <= month <= 12:
-                return month, year, "month"
+                return month, year
 
     fn_match = re.search(r"t0?(\d{1,2})[-_. ]*(20\d{2})", source)
     if fn_match:
         month = int(fn_match.group(1))
         year = int(fn_match.group(2))
         if 1 <= month <= 12:
-            return month, year, "month"
+            return month, year
+
+    fn_match2 = re.search(r"(?:thang|t)?[-_ ]?0?(\d{1,2})[-_. ]+(20\d{2})", source)
+    if fn_match2:
+        month = int(fn_match2.group(1))
+        year = int(fn_match2.group(2))
+        if 1 <= month <= 12:
+            return month, year
 
     return None
 
@@ -161,271 +177,740 @@ def extract_revision(text: str, filename: str) -> int:
     return 0
 
 
-def detect_tax_type(text: str, filename: str) -> str:
-    source = fold(text + "\n" + filename)
+def detect_tax_type(text: str) -> str | None:
+    source = fold(text[:12000])
+    if "01/gtgt" in source or "gia tri gia tang" in source:
+        return TAX_VAT
+    if "05/kk-tncn" in source or "02/kk-tncn" in source or ("05/kk-" in source and "thu nhap ca nhan" in source) or "thu nhap ca nhan" in source:
+        return TAX_PIT
     if "01/ntnn" in source or "nha thau" in source:
         return TAX_FCT
-    if "03/tndn" in source or "thu nhap doanh nghiep" in source:
+    if "03/tndn" in source or "03-tndn" in source or "03_tndn" in source or ("quyet toan" in source and "thu nhap doanh nghiep" in source) or "thu nhap doanh nghiep" in source:
         return TAX_CIT
-    if "05/kk-tncn" in source or "05/tncn" in source or "02/kk-tncn" in source or "thu nhap ca nhan" in source:
-        return TAX_PIT
-    return TAX_VAT
+    # Mặc định kiểm tra chỉ tiêu [43] hoặc [22]
+    if "[43]" in source or "[22]" in source or "[25]" in source:
+        return TAX_VAT
+    return None
 
 
-def extract_indicators_from_text(text: str, tax_type: str = TAX_VAT) -> tuple[dict[str, int], list[str]]:
+def extract_indicators(text: str) -> tuple[dict[str, int], list[str]]:
     results: dict[str, int] = {}
-    missing: list[str] = []
+    lines = clean_pdf_text(text).splitlines()
+    marker = re.compile(r"\[\s*(24a|24|25|26|29|30|31|32a|32|33|37|38|42|43|22)\s*\]", re.I)
+    amount_at_start = re.compile(
+        r"^\s*(?:(?:vnd|vnđ|đ|đồng|:)\s*)*"
+        r"(\(\s*(?:\d{1,3}(?:[.,]\d{3})+|[1-9]\d*|0)\s*\)|"
+        r"-?\s*(?:\d{1,3}(?:[.,]\d{3})+|[1-9]\d*|0))",
+        re.I,
+    )
+    for line in lines:
+        matches = list(marker.finditer(line))
+        for index, match in enumerate(matches):
+            code = match.group(1).lower()
+            if code in results:
+                continue
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(line)
+            next_bracket = line.find("[", match.end())
+            if next_bracket != -1 and (index + 1 >= len(matches) or next_bracket < matches[index + 1].start()):
+                end = next_bracket
+            after = line[match.end():end]
+            value_match = amount_at_start.match(after)
+            if not value_match:
+                continue
+            try:
+                results[code] = parse_amount(value_match.group(1))
+            except ValueError:
+                continue
 
-    if tax_type == TAX_VAT:
-        target_codes = VAT_INDICATORS
-    elif tax_type == TAX_PIT:
-        target_codes = PIT_INDICATORS
-    elif tax_type == TAX_CIT:
-        target_codes = CIT_INDICATORS
-    else:
-        target_codes = FCT_INDICATORS
+    if "22" not in results:
+        results["22"] = 0
 
-    normalized = clean_pdf_text(text)
-    lines = normalized.splitlines()
-
-    for code in target_codes:
-        found = False
-        patterns = [
-            rf"\[{re.escape(code)}\]\s*[:=-]?\s*([0-9.,() -]+)",
-            rf"\b{re.escape(code)}\b\s*[:=-]?\s*([0-9.,() -]+)",
-        ]
-        for pattern in patterns:
-            for line in lines:
-                m = re.search(pattern, line, re.IGNORECASE)
-                if m:
-                    try:
-                        results[code] = parse_amount(m.group(1))
-                        found = True
-                        break
-                    except ValueError:
-                        pass
-            if found:
-                break
-        if not found:
-            # Gán mặc định bằng 0 nếu không tìm thấy
-            results[code] = 0
-            missing.append(code)
-
+    missing = [code for code in VAT_INDICATORS if code not in results]
     return results, missing
 
 
-def read_pdf_declaration(path: Path) -> Declaration:
-    text_parts = []
-    with pdfplumber.open(str(path)) as pdf:
-        for page in pdf.pages:
-            t = page.extract_text()
-            if t:
-                text_parts.append(t)
+def extract_pit_indicator_29(text: str) -> int | None:
+    marker = re.compile(r"\[\s*29\s*\]", re.I)
+    amount_after_marker = re.compile(
+        r"^\s*(?:(?:VNĐ|VND|đồng)\s*)*"
+        r"(\(\s*(?:\d{1,3}(?:[.,]\d{3})+|\d+)\s*\)|"
+        r"-?\s*(?:\d{1,3}(?:[.,]\d{3})+|\d+))",
+        re.I,
+    )
+    for line in clean_pdf_text(text).splitlines():
+        matches = list(marker.finditer(line))
+        for index, match in enumerate(matches):
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(line)
+            after = line[match.end():end]
+            value_match = amount_after_marker.match(after)
+            if value_match:
+                return parse_amount(value_match.group(1))
+    return None
 
-    full_text = "\n".join(text_parts)
+
+def extract_cit_indicators(text: str) -> tuple[dict[str, int], list[str]]:
+    results: dict[str, int] = {}
+    lines = clean_pdf_text(text).splitlines()
+    for code in CIT_INDICATORS:
+        pattern = re.compile(
+            rf"(?:\[\s*{code}\s*\]|\b{code}\b)\s+([(-]?\s*\d[\d.,]*\)?)(?:\s*(?:vnd|vnđ|đ|đồng))?\s*$",
+            re.I,
+        )
+        for line in lines:
+            line_clean = line.strip()
+            match = pattern.search(line_clean)
+            if match:
+                try:
+                    results[code] = parse_amount(match.group(1))
+                    break
+                except ValueError:
+                    continue
+    for code in CIT_INDICATORS:
+        if code in results:
+            continue
+        pattern = re.compile(
+            rf"(?:\[\s*{code}\s*\]|\b{code}\b)\s+([(-]?\s*\d[\d.,]*\)?)\b",
+            re.I,
+        )
+        for line in lines:
+            line_clean = line.strip()
+            if f"={code}" in line_clean or f"+{code}" in line_clean or f"-{code}" in line_clean:
+                continue
+            match = pattern.search(line_clean)
+            if match:
+                try:
+                    results[code] = parse_amount(match.group(1))
+                    break
+                except ValueError:
+                    continue
+    missing = [code for code in CIT_INDICATORS if code not in results]
+    return results, missing
+
+
+def _fct_header_code(text: str) -> str | None:
+    compact = fold(text).replace(" ", "")
+    exact = {"(7)": "07", "(8)": "08", "(10)": "10", "(11)": "11", "(12)": "12"}
+    if compact in exact:
+        return exact[compact]
+    if compact.startswith("(9=7x8"):
+        return "09"
+    if compact.startswith("[13="):
+        return "13"
+    if compact.startswith("(14)"):
+        return "14"
+    return None
+
+
+def extract_fct_indicators_from_word_pages(
+    word_pages: list[list[dict]],
+) -> tuple[dict[str, int], list[str]]:
+    column_centers: dict[str, float] | None = None
+    for words in word_pages:
+        markers = []
+        for word in words:
+            code = _fct_header_code(str(word.get("text", "")))
+            if code:
+                markers.append((code, word))
+        marker_09 = next((word for code, word in markers if code == "09"), None)
+        if marker_09 is not None:
+            marker_top = float(marker_09["top"])
+            nearby: dict[str, dict] = {}
+            for code, word in markers:
+                if abs(float(word["top"]) - marker_top) <= 12:
+                    current = nearby.get(code)
+                    if current is None or abs(float(word["top"]) - marker_top) < abs(float(current["top"]) - marker_top):
+                        nearby[code] = word
+            if all(code in nearby for code in ("08", "09", "10", "12", "13", "14")):
+                column_centers = {
+                    code: (float(word["x0"]) + float(word["x1"])) / 2
+                    for code, word in nearby.items()
+                }
+
+        if not column_centers:
+            continue
+        ordered = sorted(column_centers.items(), key=lambda item: item[1])
+        positions = {code: index for index, (code, _) in enumerate(ordered)}
+        for total_word in words:
+            if fold(str(total_word.get("text", ""))).strip(" :") != "tong":
+                continue
+            row_top = float(total_word["top"])
+            row_words = [word for word in words if abs(float(word["top"]) - row_top) <= 3]
+            if not any(fold(str(word.get("text", ""))).strip(" :") == "cong" for word in row_words):
+                continue
+            numeric_words = []
+            for word in row_words:
+                raw = str(word.get("text", "")).strip()
+                if not re.fullmatch(r"\(?\s*-?\d[\d.,]*\s*\)?", raw):
+                    continue
+                try:
+                    value = parse_amount(raw)
+                except ValueError:
+                    continue
+                center = (float(word["x0"]) + float(word["x1"])) / 2
+                numeric_words.append((center, value))
+            results: dict[str, int] = {}
+            for target in ("09", "13"):
+                index = positions[target]
+                center = ordered[index][1]
+                left = (ordered[index - 1][1] + center) / 2 if index > 0 else center - 30
+                right = (center + ordered[index + 1][1]) / 2 if index + 1 < len(ordered) else center + 30
+                candidates = [item for item in numeric_words if left <= item[0] < right]
+                results[target] = min(candidates, key=lambda item: abs(item[0] - center))[1] if candidates else 0
+            return results, []
+    return {}, ["09", "13"]
+
+
+def extract_fct_indicators_from_pdf(path: Path) -> tuple[dict[str, int], list[str]]:
+    word_pages: list[list[dict]] = []
+    try:
+        with pdfplumber.open(path) as pdf:
+            for page in pdf.pages:
+                deduped = page.dedupe_chars(tolerance=1)
+                word_pages.append(deduped.extract_words(
+                    x_tolerance=2,
+                    y_tolerance=3,
+                    keep_blank_chars=False,
+                    use_text_flow=False,
+                ))
+    except Exception:
+        return {}, ["09", "13"]
+    return extract_fct_indicators_from_word_pages(word_pages)
+
+
+def extract_fct_indicators_layout(layout_text: str) -> tuple[dict[str, int], list[str]]:
+    amount_pattern = re.compile(r"(?<!\d)(?:\(\s*\d[\d.,]*\s*\)|-?\d[\d.,]*)(?!\d)")
+    marker_patterns = {
+        "07": re.compile(r"\(\s*7\s*\)", re.I),
+        "08": re.compile(r"\(\s*8\s*\)", re.I),
+        "09": re.compile(r"\(\s*9\s*(?:=\s*7\s*[x×*]\s*8\s*)?\)", re.I),
+        "10": re.compile(r"\(\s*10\s*\)", re.I),
+        "11": re.compile(r"\(\s*11\s*\)", re.I),
+        "12": re.compile(r"\(\s*12\s*\)", re.I),
+        "13": re.compile(r"\[\s*13\s*=\s*.*?(?=\s{2,}\(\s*14\s*\)|$)", re.I),
+        "14": re.compile(r"\(\s*14\s*(?:=\s*\(?\s*9\s*\)?\s*\+\s*\(?\s*13\s*\)?\s*)?\)", re.I),
+    }
+    layout_text = clean_pdf_text(layout_text)
+    column_centers: dict[str, float] | None = None
+    total_rows: list[str] = []
+    for line in layout_text.splitlines():
+        centers: dict[str, float] = {}
+        for code, pattern in marker_patterns.items():
+            match = pattern.search(line)
+            if match:
+                centers[code] = (match.start() + match.end()) / 2
+        if all(code in centers for code in ("07", "09", "10", "13", "14")):
+            column_centers = centers
+        if "tong cong" in fold(line):
+            total_rows.append(line)
+            if column_centers:
+                ordered = sorted(column_centers.items(), key=lambda item: item[1])
+                left_edge = ordered[0][1] - ((ordered[1][1] - ordered[0][1]) / 2 if len(ordered) > 1 else 20)
+                right_edge = ordered[-1][1] + ((ordered[-1][1] - ordered[-2][1]) / 2 if len(ordered) > 1 else 20)
+                assigned: dict[str, int] = {}
+                for match in amount_pattern.finditer(line):
+                    token_center = (match.start() + match.end()) / 2
+                    if not left_edge <= token_center <= right_edge:
+                        continue
+                    code = min(ordered, key=lambda item: abs(item[1] - token_center))[0]
+                    try:
+                        assigned[code] = parse_amount(match.group(0))
+                    except ValueError:
+                        continue
+                return {"09": assigned.get("09", 0), "13": assigned.get("13", 0)}, []
+
+    for line in total_rows:
+        tokens = amount_pattern.findall(line)
+        if len(tokens) < 7:
+            continue
+        try:
+            values = [parse_amount(token) for token in tokens[-7:]]
+        except ValueError:
+            continue
+        return {"09": values[2], "13": values[5]}, []
+    return {}, ["09", "13"]
+
+
+def convert_image_to_pdf(image_path: Path, output_pdf_path: Path) -> Path:
+    """Chuyển đổi file hình ảnh (PNG, JPG, BMP...) sang định dạng chuẩn PDF."""
+    from PIL import Image
+    with Image.open(str(image_path)) as img:
+        rgb = img.convert("RGB")
+        rgb.save(str(output_pdf_path), "PDF", resolution=150.0)
+    return output_pdf_path
+
+
+def read_scan_declaration(path: Path) -> Declaration:
+    """Đọc tờ khai từ bản scan/ảnh qua OCR (RapidOCR)."""
+    try:
+        from tax_scan_ocr import scan_pages, ocr_pages_to_text, printed_pit_amounts
+    except Exception as exc:
+        raise ValueError(f"Thiếu bộ xử lý OCR scan/ảnh: {exc}")
+
+    pages = scan_pages(path)
+    full_text = ocr_pages_to_text(pages)
     if not full_text.strip():
-        # Fallback PyPDF
-        reader = PdfReader(str(path))
-        full_text = "\n".join(page.extract_text() or "" for page in reader.pages)
+        raise ValueError("OCR: Không nhận diện được chữ hoặc số liệu từ bản scan/ảnh")
 
-    if not full_text.strip():
-        raise ValueError(f"Không thể đọc nội dung văn bản trong file PDF '{path.name}'.")
+    tax_type = detect_tax_type(full_text)
+    if tax_type is None:
+        source = fold(full_text[:8000])
+        if "06/tncn" in source:
+            raise ValueError("Bỏ qua mẫu 06/TNCN: chỉ tiêu 29 không phải số thuế khấu trừ")
+        raise ValueError("OCR: Không nhận diện được mẫu tờ khai 01/GTGT, 05/KK-TNCN, 01/NTNN hoặc 03/TNDN")
 
-    tax_type = detect_tax_type(full_text, path.name)
     period = extract_period(full_text, path.name)
     if not period:
-        raise ValueError(f"Không xác định được tháng/quý/năm kê khai trong file '{path.name}'.")
+        raise ValueError("OCR: Không xác định được tháng/quý/năm kê khai từ bản scan/ảnh")
 
-    month, year, period_type = period
+    period_source = fold(full_text + "\n" + path.name)
+    is_quarterly = bool(re.search(r"(?:ky\s*tinh\s*thue.{0,100}?)?quy\s*[1-4]", period_source, re.DOTALL))
+    is_annual = (tax_type == TAX_CIT) or bool(re.search(r"ky\s*tinh\s*thue.{0,100}?nam\s*20\d{2}", period_source, re.DOTALL))
     revision = extract_revision(full_text, path.name)
-    values, missing = extract_indicators_from_text(full_text, tax_type)
+    period_type = "year" if is_annual else ("quarter" if is_quarterly else "month")
+
+    mtime = path.stat().st_mtime if path.exists() else 0.0
+
+    if tax_type == TAX_VAT:
+        values, missing = extract_indicators(full_text)
+        note = "Đọc từ bản scan/ảnh OCR (01/GTGT)."
+        return Declaration(
+            path=path, month=period[0], year=period[1], revision=revision,
+            values=values, missing=missing, modified=mtime, tax_type=TAX_VAT,
+            period_type=period_type, note=note,
+            source_format="IMAGE" if path.suffix.lower() in IMAGE_SUFFIXES else "SCAN_PDF",
+            priority_rank=1,
+        )
+    elif tax_type == TAX_PIT:
+        try:
+            amounts = printed_pit_amounts(pages)
+            pit_val = amounts["29"]
+            note = "OCR số in trong bảng; đối chiếu [29] = [30] + [31]."
+        except Exception:
+            pit_val = extract_pit_indicator_29(full_text)
+            note = "Đọc từ bản scan/ảnh OCR (05/KK-TNCN)."
+        values = {"29": pit_val} if pit_val is not None else {}
+        missing = [] if pit_val is not None else ["29"]
+        return Declaration(
+            path=path, month=period[0], year=period[1], revision=revision,
+            values=values, missing=missing, modified=mtime, tax_type=TAX_PIT,
+            period_type=period_type, note=note,
+            source_format="IMAGE" if path.suffix.lower() in IMAGE_SUFFIXES else "SCAN_PDF",
+            priority_rank=1,
+        )
+    elif tax_type == TAX_CIT:
+        values, missing = extract_cit_indicators(full_text)
+        note = "Đọc từ bản scan/ảnh OCR (03/TNDN)."
+        return Declaration(
+            path=path, month=period[0], year=period[1], revision=revision,
+            values=values, missing=missing, modified=mtime, tax_type=TAX_CIT,
+            period_type=period_type, note=note,
+            source_format="IMAGE" if path.suffix.lower() in IMAGE_SUFFIXES else "SCAN_PDF",
+            priority_rank=1,
+        )
+    else:  # TAX_FCT
+        values, missing = extract_fct_indicators_layout(full_text)
+        note = "Đọc từ bản scan/ảnh OCR (01/NTNN)."
+        return Declaration(
+            path=path, month=period[0], year=period[1], revision=revision,
+            values=values, missing=missing, modified=mtime, tax_type=TAX_FCT,
+            period_type=period_type, note=note,
+            source_format="IMAGE" if path.suffix.lower() in IMAGE_SUFFIXES else "SCAN_PDF",
+            priority_rank=1,
+        )
+
+
+def read_pdf_declaration(path: Path) -> Declaration:
+    """Đọc tờ khai từ file PDF kỹ thuật số (hoặc tự động chuyển fallback sang OCR nếu là bản scan)."""
+    reader = PdfReader(str(path))
+    if reader.is_encrypted:
+        try:
+            reader.decrypt("")
+        except Exception as exc:
+            raise ValueError(f"File PDF '{path.name}' bị khóa mật khẩu") from exc
+
+    text = ""
+    try:
+        with pdfplumber.open(path) as pdf:
+            pages = [page.extract_text() or "" for page in pdf.pages]
+            text = clean_pdf_text("\n".join(pages))
+    except Exception:
+        text = ""
+
+    if len(text.strip()) < 40:
+        text = clean_pdf_text("\n".join((page.extract_text() or "") for page in reader.pages))
+
+    # Nếu văn bản quá ít (< 40 ký tự) -> Đây là file PDF scan/ảnh chụp -> Dùng bộ OCR
+    if len(text.strip()) < 40:
+        return read_scan_declaration(path)
+
+    tax_type = detect_tax_type(text)
+    if tax_type is None:
+        source = fold(text[:8000])
+        if "06/tncn" in source:
+            raise ValueError("Bỏ qua mẫu 06/TNCN: chỉ tiêu 29 không phải số thuế khấu trừ")
+        # Thử fallback qua OCR phòng trường hợp font chữ bị mã hóa CID
+        try:
+            return read_scan_declaration(path)
+        except Exception:
+            raise ValueError(f"Không nhận diện được loại tờ khai thuế hợp lệ trong file '{path.name}'")
+
+    period_source = fold(text + "\n" + path.name)
+    is_quarterly = bool(re.search(r"(?:ky\s*tinh\s*thue.{0,100}?)?quy\s*[1-4]", period_source, re.DOTALL))
+    is_annual = (tax_type == TAX_CIT) or bool(re.search(r"ky\s*tinh\s*thue.{0,100}?nam\s*20\d{2}", period_source, re.DOTALL))
+    period = extract_period(text, path.name)
+    if not period:
+        raise ValueError(f"Không xác định được tháng/quý/năm kê khai trong file '{path.name}'")
+
+    period_type = "year" if is_annual else ("quarter" if is_quarterly else "month")
+
+    if tax_type == TAX_VAT:
+        values, missing = extract_indicators(text)
+    elif tax_type == TAX_PIT:
+        layout_text = "\n".join((page.extract_text(extraction_mode="layout") or "") for page in reader.pages)
+        pit_value = extract_pit_indicator_29(layout_text)
+        if pit_value is None:
+            pit_value = extract_pit_indicator_29(text)
+        values = {"29": pit_value} if pit_value is not None else {}
+        missing = [] if pit_value is not None else ["29"]
+    elif tax_type == TAX_CIT:
+        values, missing = extract_cit_indicators(text)
+    else:  # TAX_FCT
+        values, missing = extract_fct_indicators_from_pdf(path)
+        if missing:
+            layout_text = "\n".join((page.extract_text(extraction_mode="layout") or "") for page in reader.pages)
+            values, missing = extract_fct_indicators_layout(layout_text)
 
     mtime = path.stat().st_mtime if path.exists() else 0.0
     return Declaration(
         path=path,
-        year=year,
-        month=month,
-        revision=revision,
+        month=period[0],
+        year=period[1],
+        revision=extract_revision(text, path.name),
         values=values,
         missing=missing,
-        period_type=period_type,
-        tax_type=tax_type,
         modified=mtime,
+        tax_type=tax_type,
+        period_type=period_type,
+        note="",
+        source_format="PDF",
+        priority_rank=2,
     )
+
+
+def xml_local_name(tag: str) -> str:
+    return fold(tag.rsplit("}", 1)[-1]).replace("_", "").replace("-", "")
+
+
+def parse_xml_period_value(raw_period: str, is_quarterly: bool) -> tuple[int, int] | None:
+    raw_period = raw_period.strip()
+    match = re.fullmatch(r"\s*(?:nam\s*|y)?(20\d{2})\s*", fold(raw_period))
+    if match:
+        return 12, int(match.group(1))
+    match = re.fullmatch(r"\s*(\d{1,2})\s*[/.-]\s*(\d{1,2})\s*[/.-]\s*(20\d{2})\s*", raw_period)
+    if match:
+        month, year = int(match.group(2)), int(match.group(3))
+        if 1 <= month <= 12:
+            return month, year
+    match = re.fullmatch(r"\s*(20\d{2})\s*[/.-]\s*(\d{1,2})\s*[/.-]\s*(\d{1,2})\s*", raw_period)
+    if match:
+        month, year = int(match.group(2)), int(match.group(1))
+        if 1 <= month <= 12:
+            return month, year
+    match = re.fullmatch(r"\s*(0?[1-9]|1[0-2])\s*/\s*(20\d{2})\s*", raw_period)
+    if match:
+        number, year = int(match.group(1)), int(match.group(2))
+        return (number * 3, year) if is_quarterly and 1 <= number <= 4 else (number, year)
+    return extract_period(raw_period, "")
 
 
 def read_xml_declaration(path: Path) -> Declaration:
-    tree = ET.parse(str(path))
-    root = tree.getroot()
+    """Đọc tờ khai từ file XML chuẩn nộp Thuế điện tử eTax (Tổng cục Thuế)."""
+    try:
+        root = ET.parse(path).getroot()
+    except ET.ParseError as exc:
+        raise ValueError(f"File XML '{path.name}' bị lỗi cấu trúc") from exc
 
-    xml_text = " ".join(root.itertext())
-    tax_type = detect_tax_type(xml_text, path.name)
+    fields: list[tuple[str, str]] = []
+    for element in root.iter():
+        value = (element.text or "").strip()
+        if value:
+            fields.append((xml_local_name(element.tag), value))
 
-    # Tìm kỳ tính thuế trong XML
-    month = None
-    year = None
-    period_type = "month"
+    searchable = "\n".join(value for _, value in fields) + "\n" + path.name
+    tax_type = detect_tax_type(searchable)
+    if tax_type is None:
+        raise ValueError(f"Không phải XML tờ khai 01/GTGT, 05/KK-TNCN, 01/NTNN hoặc 03/TNDN: '{path.name}'")
 
-    for tag in ("kyKKhai", "kyTinhThue", "kyKTT"):
-        elem = root.find(f".//{tag}")
-        if elem is not None and elem.text:
-            p = extract_period(elem.text, path.name)
-            if p:
-                month, year, period_type = p
+    # Bóc tách các thẻ con định danh theo dạng <ChiTieu><ma>...</ma><giaTri>...</giaTri></ChiTieu>
+    structured_values: dict[str, str] = {}
+    for parent in root.iter():
+        children = list(parent)
+        if len(children) >= 2:
+            code_child = None
+            val_child = None
+            for ch in children:
+                ch_tag = xml_local_name(ch.tag)
+                if ch_tag in {"ma", "maso", "mact", "machitieu", "id", "code"}:
+                    code_child = (ch.text or "").strip()
+                elif ch_tag in {"giatri", "sotien", "tien", "value", "amount", "so"}:
+                    val_child = (ch.text or "").strip()
+            if code_child and val_child:
+                norm_code = xml_local_name(code_child)
+                structured_values[norm_code] = val_child
+
+    quarter_markers = [value for name, value in fields if name in {"kieuky", "kykkhai", "kykekhai", "kytinhthue"}]
+    quarter_source = fold(" ".join(quarter_markers) + " " + path.name)
+    is_quarterly = bool(re.search(r"(?:quy\s*|\bq\s*)[1-4]", quarter_source)) or any(
+        fold(value).strip() in {"q", "quy"} for value in quarter_markers
+    )
+    is_annual = (tax_type == TAX_CIT)
+    period = None
+    if tax_type == TAX_CIT:
+        for name, raw_value in fields:
+            if name in {"namkkhai", "namkekhai", "namtinhthue", "nam", "namqt", "namqtt", "kykkhai", "kykekhai", "kytinhthue", "kykkhaitungay", "kykekhaitungay"}:
+                match = re.search(r"20\d{2}", raw_value)
+                if match:
+                    period = (12, int(match.group(0)))
+                    break
+    if period is None:
+        primary_period_names = {"kykkhai", "kykekhai", "kytinhthue"}
+        secondary_period_names = {"kykkhaitungay", "kykekhaitungay", "tungay"}
+        period_values = [value for name, value in fields if name in primary_period_names]
+        if not period_values:
+            period_values = [value for name, value in fields if name in secondary_period_names]
+        for raw_period in period_values:
+            period = parse_xml_period_value(raw_period, is_quarterly)
+            if period:
                 break
+    if period is None:
+        period = extract_period(searchable if tax_type == TAX_CIT else "", path.name)
+    if not period:
+        raise ValueError(f"Không xác định được tháng/quý/năm kê khai trong file XML '{path.name}'")
 
-    if not month or not year:
-        p = extract_period(xml_text, path.name)
-        if p:
-            month, year, period_type = p
+    requested = (
+        (*VAT_INDICATORS, "22")
+        if tax_type == TAX_VAT
+        else (("29",) if tax_type == TAX_PIT else (CIT_INDICATORS if tax_type == TAX_CIT else ("09", "13")))
+    )
+    values: dict[str, int] = {}
+    for code in requested:
+        normalized_code = code.lower()
+        compact_code = normalized_code.lstrip("0") or "0"
+        accepted_names = {
+            normalized_code,
+            compact_code,
+            f"ct{normalized_code}",
+            f"ct{compact_code}",
+            f"chitieu{normalized_code}",
+            f"chitieu{compact_code}",
+            f"chitieutokhai{normalized_code}",
+            f"chitieutokhai{compact_code}",
+            f"ctkkhai{normalized_code}",
+            f"ctkkhai{compact_code}",
+        }
+        if tax_type == TAX_VAT and normalized_code == "24":
+            preferred_names = {"ct24", "chitieu24", "chitieutokhai24", "ctkkhai24"}
+            candidate_fields = [item for item in fields if item[0] in preferred_names]
+            candidate_fields += [item for item in fields if item[0] in accepted_names]
+        elif tax_type == TAX_FCT and normalized_code in {"09", "13"}:
+            preferred_names = {
+                f"tongthuegtgtphatsinh{compact_code}",
+                f"tongthuetndnphatsinh{compact_code}",
+                f"tongchitieu{compact_code}",
+            }
+            candidate_fields = [item for item in fields if item[0] in preferred_names]
+            candidate_fields += [item for item in fields if item[0] in accepted_names]
         else:
-            raise ValueError(f"Không xác định được kỳ kê khai trong file XML '{path.name}'.")
-
-    # Lần nộp / bổ sung
-    revision = 0
-    for tag in ("soLan", "lanBS", "lanThayDoi"):
-        elem = root.find(f".//{tag}")
-        if elem is not None and elem.text:
+            candidate_fields = [item for item in fields if item[0] in accepted_names]
+            for candidate_key in accepted_names:
+                if candidate_key in structured_values:
+                    candidate_fields.append((candidate_key, structured_values[candidate_key]))
+        for _, raw_value in candidate_fields:
             try:
-                revision = int(elem.text.strip())
+                values[code] = parse_amount(raw_value)
                 break
             except ValueError:
-                pass
+                continue
 
-    values: dict[str, int] = {}
-    missing: list[str] = []
+    if tax_type == TAX_CIT:
+        found_any = any(code in values for code in CIT_INDICATORS)
+        if found_any:
+            for code in CIT_INDICATORS:
+                if code not in values:
+                    values[code] = 0
 
     if tax_type == TAX_VAT:
-        target_codes = VAT_INDICATORS
-    elif tax_type == TAX_PIT:
-        target_codes = PIT_INDICATORS
-    elif tax_type == TAX_CIT:
-        target_codes = CIT_INDICATORS
-    else:
-        target_codes = FCT_INDICATORS
+        if "22" not in values:
+            values["22"] = 0
 
-    # Quét tất cả các thẻ XML có thuộc tính hoặc tên khớp với mã chỉ tiêu
-    for elem in root.iter():
-        text_val = (elem.text or "").strip()
-        tag_name = elem.tag
-        # Check attributes
-        for attr_k, attr_v in elem.attrib.items():
-            attr_clean = attr_v.replace("[", "").replace("]", "").strip()
-            if attr_clean in target_codes and text_val:
-                try:
-                    values[attr_clean] = parse_amount(text_val)
-                except ValueError:
-                    pass
-
-        # Check tag name (ví dụ ct22, ct24, ct25, ct32a...)
-        m = re.match(r"^ct(\w+)$", tag_name, re.I)
-        if m and text_val:
-            code = m.group(1).lower()
-            if code in target_codes:
-                try:
-                    values[code] = parse_amount(text_val)
-                except ValueError:
-                    pass
-
-    # Bổ sung các chỉ tiêu thiếu
-    for code in target_codes:
-        if code not in values:
-            values[code] = 0
-            missing.append(code)
+    required_codes = VAT_INDICATORS if tax_type == TAX_VAT else requested
+    missing = [code for code in required_codes if code not in values]
+    revision = extract_revision(searchable, path.name)
+    for name, raw_value in fields:
+        if name in {"solan", "lanbosung", "lanbs"} and raw_value.strip().isdigit():
+            revision = max(revision, int(raw_value.strip()))
 
     mtime = path.stat().st_mtime if path.exists() else 0.0
     return Declaration(
         path=path,
-        year=year,
-        month=month,
+        month=period[0],
+        year=period[1],
         revision=revision,
         values=values,
         missing=missing,
-        period_type=period_type,
-        tax_type=tax_type,
         modified=mtime,
+        tax_type=tax_type,
+        period_type="year" if (tax_type == TAX_CIT or is_annual) else ("quarter" if is_quarterly else "month"),
+        note="Chuẩn XML eTax Tổng cục Thuế (Độ chính xác cao nhất).",
+        source_format="XML",
+        priority_rank=3,
     )
 
 
-def extract_archive(archive_path: Path, extract_dir: Path) -> list[Path]:
-    """Giải nén tệp zip hoặc rar và trả về danh sách các tệp trích xuất."""
-    extracted: list[Path] = []
-    suffix = archive_path.suffix.lower()
-
-    if suffix == ".zip":
-        with zipfile.ZipFile(str(archive_path), "r") as zf:
-            zf.extractall(str(extract_dir))
-    elif suffix == ".rar":
-        try:
-            import rarfile
-            with rarfile.RarFile(str(archive_path), "r") as rf:
-                rf.extractall(str(extract_dir))
-        except Exception:
-            # Fallback nếu trên máy tính có WinRAR/UnRAR
-            unrar = shutil.which("unrar") or shutil.which("UnRAR.exe") or "C:\\Program Files\\WinRAR\\UnRAR.exe"
-            if os.path.exists(unrar):
-                import subprocess
-                subprocess.run([unrar, "x", "-y", str(archive_path), str(extract_dir)], check=True)
-
-    for root, _, files in os.walk(str(extract_dir)):
-        for f in files:
-            p = Path(root) / f
-            if p.suffix.lower() in {".pdf", ".xml"}:
-                extracted.append(p)
-    return extracted
-
-
 def read_declaration_auto(path: Path) -> Declaration:
+    """Tự động nhận diện định dạng tệp và bóc tách theo đúng ưu tiên."""
     ext = path.suffix.lower()
     if ext == ".xml":
         return read_xml_declaration(path)
+    elif ext in IMAGE_SUFFIXES:
+        return read_scan_declaration(path)
     elif ext == ".pdf":
         return read_pdf_declaration(path)
     else:
         raise ValueError(f"Định dạng tệp không được hỗ trợ: {path.name}")
 
 
+def extract_archive(archive_path: Path, extract_dir: Path) -> list[Path]:
+    """Giải nén an toàn file ZIP hoặc RAR, quét đệ quy các file hợp lệ."""
+    extracted: list[Path] = []
+    suffix = archive_path.suffix.lower()
+
+    if suffix == ".zip":
+        with zipfile.ZipFile(str(archive_path), "r") as zf:
+            for info in zf.infolist():
+                norm = info.filename.replace("\\", "/")
+                parts = Path(norm).parts
+                if not norm or Path(norm).is_absolute() or ".." in parts:
+                    continue
+                target = (extract_dir / Path(*parts)).resolve()
+                if info.is_dir():
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(info, "r") as src, open(target, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+    elif suffix == ".rar":
+        unrar = shutil.which("unrar") or shutil.which("UnRAR.exe") or "C:\\Program Files\\WinRAR\\UnRAR.exe"
+        if unrar and os.path.exists(unrar):
+            subprocess.run([unrar, "x", "-y", str(archive_path), str(extract_dir) + os.sep], check=False)
+        else:
+            try:
+                import rarfile
+                with rarfile.RarFile(str(archive_path), "r") as rf:
+                    rf.extractall(str(extract_dir))
+            except Exception as exc:
+                raise ValueError(f"Không thể giải nén file RAR: {exc}")
+
+    for root, _, files in os.walk(str(extract_dir)):
+        for f in files:
+            p = Path(root) / f
+            if p.suffix.lower() in SOURCE_SUFFIXES:
+                extracted.append(p)
+    return extracted
+
+
 def select_latest_declarations(
     sources: list[Path],
     logger: Callable[[str, str], None] | None = None,
-    period_mode: str = "all"
-) -> tuple[list[Declaration], list[tuple[str, str]]]:
-    """Đọc và chọn lọc các tờ khai mới nhất cho từng kỳ tính thuế."""
+    period_mode: str = "all",
+) -> tuple[list[Declaration], list[tuple[str, str]], list[dict]]:
+    """
+    Đọc tất cả các tệp và chọn lọc tờ khai tối ưu theo nguyên tắc:
+    1. Ưu tiên định dạng: XML (hạng 3) > PDF (hạng 2) > Hình ảnh/Scan (hạng 1).
+    2. Ưu tiên lần nộp: Bổ sung lần cao hơn > Lần đầu.
+    3. Thời gian cập nhật mới hơn.
+    Trả về: (selected_declarations, errors, audit_records)
+    """
     if logger is None:
         logger = lambda m, t="info": None
 
-    parsed: list[Declaration] = []
+    declarations: list[Declaration] = []
     errors: list[tuple[str, str]] = []
+    audit_records: list[dict] = []
 
-    for src in sources:
+    for index, path in enumerate(sources, 1):
         try:
-            decl = read_declaration_auto(src)
-            # Lọc theo chế độ kỳ
-            if period_mode == "quarter" and decl.period_type != "quarter":
+            decl = read_declaration_auto(path)
+            # Lọc theo kỳ
+            if period_mode != "all" and decl.period_type in {"month", "quarter"} and decl.period_type != period_mode:
+                audit_records.append({
+                    "Tệp": path.name,
+                    "Định dạng": decl.source_format,
+                    "Loại tờ khai": decl.tax_type,
+                    "Kỳ thuế": f"{'Quý' if decl.period_type == 'quarter' else 'Tháng'} {decl.month // 3 if decl.period_type == 'quarter' else decl.month:02d}/{decl.year}",
+                    "Lần nộp": "Lần đầu" if decl.revision == 0 else f"Bổ sung L{decl.revision}",
+                    "Trạng thái": f"Bỏ qua (Do lọc {period_mode})",
+                    "Ghi chú": decl.note,
+                })
+                logger(f"Bỏ qua {path.name}: không đúng bộ lọc kỳ ({period_mode})", "info")
                 continue
-            if period_mode == "month" and decl.period_type != "month":
-                continue
-            parsed.append(decl)
-            logger(f"✔ Đã đọc thành công: {src.name} ({decl.tax_type} - Tháng/Quý {decl.month}/{decl.year} - Lần {decl.revision})", "success")
+
+            declarations.append(decl)
+            logger(f"✔ Đã đọc: {path.name} [{decl.source_format}] ({decl.tax_type} - Tháng/Quý {decl.month}/{decl.year} - Lần {decl.revision})", "success")
         except Exception as exc:
-            errors.append((src.name, str(exc)))
-            logger(f"⚠ Bỏ qua {src.name}: {exc}", "warning")
+            err_msg = str(exc)
+            errors.append((path.name, err_msg))
+            audit_records.append({
+                "Tệp": path.name,
+                "Định dạng": path.suffix.upper().replace(".", ""),
+                "Loại tờ khai": "Chưa xác định",
+                "Kỳ thuế": "-",
+                "Lần nộp": "-",
+                "Trạng thái": "❌ Lỗi đọc",
+                "Ghi chú": err_msg,
+            })
+            logger(f"⚠ Lỗi {path.name}: {err_msg}", "warning")
 
-    # Nhóm theo (tax_type, year, month) và chọn bản mới nhất (revision cao nhất hoặc modified time mới nhất)
-    grouped: dict[tuple[str, int, int], Declaration] = {}
-    for item in parsed:
+    # Áp dụng bộ lọc chọn lọc tối ưu
+    latest: dict[tuple[str, int, int], Declaration] = {}
+    fct_declarations: list[Declaration] = []
+
+    for item in declarations:
+        if item.tax_type == TAX_FCT:
+            fct_declarations.append(item)
+            continue
+
         key = (item.tax_type, item.year, item.month)
-        if key not in grouped:
-            grouped[key] = item
-        else:
-            curr = grouped[key]
-            if item.revision > curr.revision:
-                grouped[key] = item
-            elif item.revision == curr.revision and item.modified > curr.modified:
-                grouped[key] = item
+        current = latest.get(key)
 
-    latest = sorted(grouped.values(), key=lambda x: (x.tax_type, x.year, x.month))
-    return latest, errors
+        # Trọng số so sánh: (Lần bổ sung, Ưu tiên định dạng XML > PDF > Scan, Thời gian sửa đổi, Tên file)
+        score_new = (item.revision, item.priority_rank, item.modified, item.path.name)
+        score_current = (current.revision, current.priority_rank, current.modified, current.path.name) if current else (-1, -1, -1, "")
+
+        if current is None or score_new > score_current:
+            latest[key] = item
+
+    selected = sorted([*latest.values(), *fct_declarations], key=lambda x: (x.tax_type, x.year, x.month, x.revision))
+    selected_set = set(selected)
+
+    for decl in declarations:
+        period_str = f"Quý {decl.month // 3}" if decl.period_type == "quarter" else f"Tháng {decl.month:02d}"
+        if decl.period_type == "year":
+            period_str = "Cả năm"
+        rev_str = "Lần đầu" if decl.revision == 0 else f"Bổ sung L{decl.revision}"
+
+        is_chosen = decl in selected_set
+        audit_records.append({
+            "Tệp": decl.path.name,
+            "Định dạng": decl.source_format,
+            "Loại tờ khai": decl.tax_type,
+            "Kỳ thuế": f"{period_str}/{decl.year}",
+            "Lần nộp": rev_str,
+            "Trạng thái": "✅ ĐƯỢC CHỌN" if is_chosen else "Thay thế bởi bản mới/XML",
+            "Ghi chú": decl.note or ("Đã chọn vào bảng tính" if is_chosen else "Đã có bản ưu tiên hơn"),
+        })
+
+    return selected, errors, audit_records
 
 
 def write_to_excel_openpyxl(
@@ -433,7 +918,7 @@ def write_to_excel_openpyxl(
     output_path: Path,
     declarations: list[Declaration],
     parse_errors: list[tuple[str, str]],
-    logger: Callable[[str, str], None] | None = None
+    logger: Callable[[str, str], None] | None = None,
 ) -> Path:
     """
     Ghi kết quả vào file Excel dựa trên mẫu MẪU.xlsx bằng thư viện OpenPyXL.
@@ -477,7 +962,7 @@ def write_to_excel_openpyxl(
                     for code, col_idx in code_cols.items():
                         vat_targets[(m, code)] = (r, col_idx)
 
-        # Ghi giá trị 0 mặc định cho tất cả 180 ô dữ liệu VAT
+        # Ghi giá trị 0 mặc định cho tất cả ô dữ liệu VAT
         for (m, code), (r, c) in vat_targets.items():
             cell = ws_vat.cell(r, c)
             cell.value = 0
@@ -507,7 +992,7 @@ def write_to_excel_openpyxl(
             if decl_col:
                 break
         if decl_col is None:
-            decl_col = 2  # Cột B mặc định
+            decl_col = 2
 
         pit_rows: dict[int, int] = {}
         for r in range(1, ws_pit.max_row + 1):
@@ -596,12 +1081,10 @@ def write_to_excel_openpyxl(
         wb.remove(ws_log)
     ws_log = wb.create_sheet(title=log_sheet_name, index=0)
 
-    # Định dạng tiêu đề Nhật ký
     header_font = Font(name="Segoe UI", size=10, bold=True, color="FFFFFF")
     header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
     center_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
     left_align = Alignment(horizontal="left", vertical="center")
-    right_align = Alignment(horizontal="right", vertical="center")
     thin_border = Border(
         left=Side(style="thin", color="D9D9D9"),
         right=Side(style="thin", color="D9D9D9"),
@@ -609,7 +1092,7 @@ def write_to_excel_openpyxl(
         bottom=Side(style="thin", color="D9D9D9"),
     )
 
-    headers = ["Năm", "Tháng/Kỳ", "Loại tờ khai", "Lần nộp", "Tên tệp tờ khai", "Chỉ tiêu thiếu", "Ghi chú"]
+    headers = ["Năm", "Tháng/Kỳ", "Loại tờ khai", "Lần nộp", "Định dạng", "Tên tệp tờ khai", "Chỉ tiêu thiếu", "Ghi chú"]
     for col_idx, h in enumerate(headers, 1):
         cell = ws_log.cell(1, col_idx, h)
         cell.font = header_font
@@ -617,7 +1100,6 @@ def write_to_excel_openpyxl(
         cell.alignment = center_align
     ws_log.row_dimensions[1].height = 26
 
-    # Ghi từng dòng nhật ký
     row_idx = 2
     for decl in declarations:
         period_str = f"Quý {decl.month // 3}" if decl.period_type == "quarter" else f"Tháng {decl.month:02d}"
@@ -629,18 +1111,18 @@ def write_to_excel_openpyxl(
         ws_log.cell(row_idx, 2, period_str).alignment = center_align
         ws_log.cell(row_idx, 3, decl.tax_type).alignment = center_align
         ws_log.cell(row_idx, 4, rev_str).alignment = center_align
-        ws_log.cell(row_idx, 5, decl.path.name).alignment = left_align
-        ws_log.cell(row_idx, 6, ", ".join(decl.missing) if decl.missing else "Đầy đủ").alignment = center_align
-        ws_log.cell(row_idx, 7, decl.note or "Thành công").alignment = left_align
+        ws_log.cell(row_idx, 5, decl.source_format).alignment = center_align
+        ws_log.cell(row_idx, 6, decl.path.name).alignment = left_align
+        ws_log.cell(row_idx, 7, ", ".join(decl.missing) if decl.missing else "Đầy đủ").alignment = center_align
+        ws_log.cell(row_idx, 8, decl.note or "Thành công").alignment = left_align
 
-        for c in range(1, 8):
+        for c in range(1, 9):
             ws_log.cell(row_idx, c).border = thin_border
             ws_log.cell(row_idx, c).font = Font(name="Segoe UI", size=9.5)
         ws_log.row_dimensions[row_idx].height = 20
         row_idx += 1
 
-    # Tự động căn chỉnh độ rộng cột
-    col_widths = [8, 14, 16, 16, 45, 20, 25]
+    col_widths = [8, 14, 16, 16, 12, 45, 20, 30]
     for i, w in enumerate(col_widths, 1):
         col_letter = openpyxl.utils.get_column_letter(i)
         ws_log.column_dimensions[col_letter].width = w
@@ -658,7 +1140,6 @@ def generate_summary_dataframes(declarations: list[Declaration]) -> dict[str, pd
     vat_records = []
     for m in range(1, 13):
         row = {"Tháng": f"Tháng {m:02d}"}
-        # Tìm tờ khai tháng m
         matched = [d for d in declarations if d.tax_type == TAX_VAT and d.month == m]
         if matched:
             d = matched[0]

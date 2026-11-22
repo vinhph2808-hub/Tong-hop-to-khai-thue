@@ -3,6 +3,7 @@
 web_app.py - Ứng dụng Web xử lý & tổng hợp số liệu tờ khai thuế (Streamlit).
 Chạy trực tiếp trên trình duyệt web, hỗ trợ người dùng từ xa không cần cài đặt.
 Tương thích 100% với Streamlit Cloud và mạng nội bộ.
+Hỗ trợ ưu tiên: XML > PDF > Hình ảnh (PNG, JPG...) chuyển sang PDF/Scan.
 """
 
 import io
@@ -73,12 +74,26 @@ st.markdown(
     .stDownloadButton button:hover {
         background-color: #15803D !important;
     }
-    .btn-clear-custom button {
-        background-color: #DC2626 !important;
-        color: white !important;
-        font-weight: 600 !important;
-        border-radius: 8px !important;
-        border: none !important;
+    .badge-xml {
+        background-color: #DBEAFE;
+        color: #1E40AF;
+        padding: 2px 8px;
+        border-radius: 4px;
+        font-weight: bold;
+    }
+    .badge-pdf {
+        background-color: #FEE2E2;
+        color: #991B1B;
+        padding: 2px 8px;
+        border-radius: 4px;
+        font-weight: bold;
+    }
+    .badge-img {
+        background-color: #DCFCE7;
+        color: #166534;
+        padding: 2px 8px;
+        border-radius: 4px;
+        font-weight: bold;
     }
     </style>
     """,
@@ -88,7 +103,7 @@ st.markdown(
 # Tiêu đề ứng dụng
 st.markdown('<div class="main-header">📑 HỆ THỐNG XỬ LÝ & TỔNG HỢP SỐ LIỆU TỜ KHAI THUẾ</div>', unsafe_allow_html=True)
 st.markdown(
-    '<div class="sub-header">Tự động đọc PDF, XML, ZIP, RAR -> Kết chuyển chính xác vào các sheet E343 (GTGT), E350 (TNCN), E370 (NTNN), E382 (TNDN) theo đúng mẫu Excel chuẩn.</div>',
+    '<div class="sub-header">Tự động quét thông minh: <b>Ưu tiên XML eTax ➜ PDF ký số / văn bản ➜ Hình ảnh chuyển PDF / Scan</b> -> Kết chuyển chính xác vào các sheet E343 (GTGT), E350 (TNCN), E370 (NTNN), E382 (TNDN).</div>',
     unsafe_allow_html=True,
 )
 
@@ -102,11 +117,11 @@ with st.sidebar:
 
     st.markdown("---")
     st.info(
-        "1. Kéo thả hoặc chọn các file **PDF, XML, ZIP, RAR** tờ khai vào khung bên phải.\n"
-        "2. Chọn kỳ lọc nếu cần (Tất cả, Theo tháng, Theo quý).\n"
-        "3. Bấm **Bắt đầu xử lý** để hệ thống tự động bóc tách số liệu.\n"
-        "4. Xem trước bảng số liệu trực tiếp trên web và bấm **Tải file Excel**.\n"
-        "5. Bấm **Xóa dữ liệu hiện tại** để nạp đợt tờ khai mới."
+        "**Thứ tự ưu tiên khi trùng kỳ kê khai:**\n"
+        "1. 🥇 **XML:** Nộp qua Thuế điện tử eTax (chính xác tuyệt đối 100%).\n"
+        "2. 🥈 **PDF:** Bản in điện tử / PDF ký số.\n"
+        "3. 🥉 **Hình ảnh / Bản Scan:** Tự động chuyển hình ảnh sang PDF và quét qua OCR.\n\n"
+        "*(Nếu cùng định dạng, tờ khai bổ sung lần sau sẽ tự động thay thế tờ khai lần trước)*"
     )
 
     st.markdown("---")
@@ -128,11 +143,11 @@ with st.sidebar:
 # Khu vực Upload tập tin có gắn key động để hỗ trợ Clear triệt để
 current_uploader_key = f"uploader_{st.session_state['uploader_key_id']}"
 uploaded_files = st.file_uploader(
-    "📤 Chọn hoặc kéo thả các tệp tờ khai thuế (PDF, XML, ZIP, RAR):",
-    type=["pdf", "xml", "zip", "rar"],
+    "📤 Chọn hoặc kéo thả các tệp tờ khai thuế (Ưu tiên XML, PDF, Hình ảnh JPG/PNG, Tệp nén ZIP/RAR):",
+    type=["xml", "pdf", "zip", "rar", "png", "jpg", "jpeg", "bmp", "tif", "tiff", "webp"],
     accept_multiple_files=True,
     key=current_uploader_key,
-    help="Có thể chọn nhiều tệp cùng một lúc. Hỗ trợ cả file nén ZIP, RAR chứa nhiều thư mục con.",
+    help="Hệ thống hỗ trợ cả XML, PDF, Hình ảnh (tự động chuyển sang PDF), và file nén ZIP/RAR chứa nhiều thư mục con.",
 )
 
 # Hiển thị thanh nút bấm thao tác
@@ -140,7 +155,7 @@ if uploaded_files or st.session_state["processed_result"] is not None:
     col_run, col_clear = st.columns([3, 2])
     with col_run:
         start_process = st.button(
-            "🚀 Bắt đầu xử lý dữ liệu & lên số Excel",
+            "🚀 Bắt đầu quét & bóc tách dữ liệu lên Excel",
             type="primary",
             use_container_width=True,
             disabled=(not uploaded_files),
@@ -150,7 +165,7 @@ if uploaded_files or st.session_state["processed_result"] is not None:
             clear_all_data()
 
     if uploaded_files:
-        st.success(f"Đã nhận **{len(uploaded_files)}** tệp sẵn sàng xử lý.")
+        st.success(f"Đã nhận **{len(uploaded_files)}** tệp sẵn sàng bóc tách.")
 else:
     start_process = False
 
@@ -159,12 +174,11 @@ if start_process and uploaded_files:
     progress_bar = st.progress(0)
     status_text = st.empty()
 
-    # Tạo thư mục làm việc tạm thời
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_path = Path(tmp_dir)
         staged_files: list[Path] = []
 
-        status_text.text("Đang chuẩn bị và giải nén các tập tin tải lên...")
+        status_text.text("Đang nhận dạng và chuẩn bị các tập tin tải lên...")
         for idx, uf in enumerate(uploaded_files):
             dest = tmp_path / uf.name
             with open(dest, "wb") as f:
@@ -179,28 +193,41 @@ if start_process and uploaded_files:
                     staged_files.extend(extracted)
                 except Exception as exc:
                     st.warning(f"Không thể giải nén {dest.name}: {exc}")
+            elif ext in tax_engine.IMAGE_SUFFIXES:
+                # Chuyển đổi file hình ảnh sang PDF và đưa vào danh sách xử lý
+                converted_pdf = tmp_path / f"{dest.stem}_anh.pdf"
+                try:
+                    tax_engine.convert_image_to_pdf(dest, converted_pdf)
+                    staged_files.append(converted_pdf)
+                except Exception:
+                    # Nếu lỗi chuyển đổi PDF thì giữ file ảnh gốc để quét OCR
+                    staged_files.append(dest)
             elif ext in {".pdf", ".xml"}:
                 staged_files.append(dest)
 
         progress_bar.progress(30)
-        status_text.text(f"Đang bóc tách số liệu từ {len(staged_files)} tờ khai...")
+        status_text.text(f"Đang phân tích và bóc tách dữ liệu từ {len(staged_files)} tài liệu...")
 
         log_messages = []
         def web_logger(msg: str, msg_type: str = "info"):
             log_messages.append((msg_type, msg))
 
-        # Chọn lọc tờ khai mới nhất
-        latest_decls, parse_errors = tax_engine.select_latest_declarations(
+        # Chọn lọc tờ khai với thứ tự ưu tiên: XML > PDF > Hình ảnh/Scan
+        latest_decls, parse_errors, audit_records = tax_engine.select_latest_declarations(
             staged_files,
             logger=web_logger,
-            period_mode=period_mode
+            period_mode=period_mode,
         )
 
         progress_bar.progress(70)
-        status_text.text("Đang kết chuyển số liệu vào mẫu Excel...")
+        status_text.text("Đang kết chuyển số liệu vào các sheet mẫu Excel...")
 
         if not latest_decls:
             st.error("Không tìm thấy tờ khai hợp lệ nào trong các tệp đã tải lên.")
+            if parse_errors:
+                with st.expander("🔍 Chi tiết nguyên nhân các tệp không đọc được:", expanded=True):
+                    for name, err in parse_errors:
+                        st.markdown(f"- ❌ **{name}**: {err}")
             st.session_state["processed_result"] = None
         else:
             template_file = Path("MẪU.xlsx")
@@ -214,7 +241,7 @@ if start_process and uploaded_files:
                     output_file,
                     latest_decls,
                     parse_errors,
-                    logger=web_logger
+                    logger=web_logger,
                 )
 
                 progress_bar.progress(100)
@@ -225,12 +252,13 @@ if start_process and uploaded_files:
 
                 dfs = tax_engine.generate_summary_dataframes(latest_decls)
 
-                # Lưu vào session_state để không bị mất khi bấm tải hoặc chuyển tab
                 st.session_state["processed_result"] = {
                     "excel_data": excel_data,
                     "latest_decls": latest_decls,
                     "dfs": dfs,
                     "log_messages": log_messages,
+                    "audit_records": audit_records,
+                    "parse_errors": parse_errors,
                 }
                 st.rerun()
 
@@ -241,6 +269,8 @@ if st.session_state["processed_result"] is not None:
     excel_data = res["excel_data"]
     dfs = res["dfs"]
     log_messages = res["log_messages"]
+    audit_records = res.get("audit_records", [])
+    parse_errors = res.get("parse_errors", [])
 
     st.success("🎉 Xử lý và lập bảng tổng hợp số liệu thuế thành công!")
 
@@ -275,7 +305,13 @@ if st.session_state["processed_result"] is not None:
         if st.button("🔄 Thêm đợt dữ liệu mới", use_container_width=True):
             clear_all_data()
 
-    # Bảng xem trước dữ liệu
+    # Bảng nhật ký quét chi tiết tất cả các file đã nạp
+    if audit_records:
+        with st.expander("📋 Nhật ký đối chiếu chi tiết tất cả tệp đã nạp (Ưu tiên XML > PDF > Ảnh)", expanded=True):
+            df_audit = pd.DataFrame(audit_records)
+            st.dataframe(df_audit, use_container_width=True, hide_index=True)
+
+    # Bảng xem trước dữ liệu số liệu
     st.markdown("### 📊 Xem trước bảng số liệu đã bóc tách:")
 
     tab_vat, tab_pit, tab_cit, tab_fct, tab_log = st.tabs([
