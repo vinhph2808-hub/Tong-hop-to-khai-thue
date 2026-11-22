@@ -1,0 +1,24 @@
+# Temporary / Build directories
+tmp/
+outputs/
+build/
+dist/
+node_modules/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Large binaries & license files
+*.exe
+*.zip
+*.lic
+*.log
+
+# OS generated
+.DS_Store
+Thumbs.db
