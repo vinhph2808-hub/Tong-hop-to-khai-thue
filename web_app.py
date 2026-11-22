@@ -24,6 +24,19 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# Khởi tạo trạng thái phiên làm việc (Session State)
+if "uploader_key_id" not in st.session_state:
+    st.session_state["uploader_key_id"] = 0
+
+if "processed_result" not in st.session_state:
+    st.session_state["processed_result"] = None
+
+def clear_all_data():
+    """Xóa sạch tệp đã tải lên và kết quả hiện tại để nạp đợt dữ liệu mới."""
+    st.session_state["uploader_key_id"] += 1
+    st.session_state["processed_result"] = None
+    st.rerun()
+
 # Tùy biến CSS giao diện hiện đại, chuyên nghiệp
 st.markdown(
     """
@@ -60,6 +73,13 @@ st.markdown(
     .stDownloadButton button:hover {
         background-color: #15803D !important;
     }
+    .btn-clear-custom button {
+        background-color: #DC2626 !important;
+        color: white !important;
+        font-weight: 600 !important;
+        border-radius: 8px !important;
+        border: none !important;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -74,12 +94,19 @@ st.markdown(
 
 # Sidebar
 with st.sidebar:
-    st.header("⚙️ Tùy chọn & Hướng dẫn")
+    st.header("⚙️ Tùy chọn & Tiện ích")
+    
+    # Nút Xóa dữ liệu nhanh trên thanh bên
+    if st.button("🗑️ Xóa toàn bộ dữ liệu & Làm mới", use_container_width=True, type="secondary"):
+        clear_all_data()
+
+    st.markdown("---")
     st.info(
         "1. Kéo thả hoặc chọn các file **PDF, XML, ZIP, RAR** tờ khai vào khung bên phải.\n"
         "2. Chọn kỳ lọc nếu cần (Tất cả, Theo tháng, Theo quý).\n"
         "3. Bấm **Bắt đầu xử lý** để hệ thống tự động bóc tách số liệu.\n"
-        "4. Xem trước bảng số liệu trực tiếp trên web và bấm **Tải file Excel**."
+        "4. Xem trước bảng số liệu trực tiếp trên web và bấm **Tải file Excel**.\n"
+        "5. Bấm **Xóa dữ liệu hiện tại** để nạp đợt tờ khai mới."
     )
 
     st.markdown("---")
@@ -98,144 +125,185 @@ with st.sidebar:
     st.markdown("- ✅ **03/TNDN:** Quyết toán thuế Thu nhập doanh nghiệp (chỉ tiêu A1, B1..B13, C3..C10, E)")
     st.markdown("- ✅ **01/NTNN:** Thuế Nhà thầu nước ngoài (chỉ tiêu 09, 13)")
 
-# Khu vực Upload tập tin
+# Khu vực Upload tập tin có gắn key động để hỗ trợ Clear triệt để
+current_uploader_key = f"uploader_{st.session_state['uploader_key_id']}"
 uploaded_files = st.file_uploader(
     "📤 Chọn hoặc kéo thả các tệp tờ khai thuế (PDF, XML, ZIP, RAR):",
     type=["pdf", "xml", "zip", "rar"],
     accept_multiple_files=True,
+    key=current_uploader_key,
     help="Có thể chọn nhiều tệp cùng một lúc. Hỗ trợ cả file nén ZIP, RAR chứa nhiều thư mục con.",
 )
 
-if uploaded_files:
-    st.success(f"Đã nhận **{len(uploaded_files)}** tệp sẵn sàng xử lý.")
+# Hiển thị thanh nút bấm thao tác
+if uploaded_files or st.session_state["processed_result"] is not None:
+    col_run, col_clear = st.columns([3, 2])
+    with col_run:
+        start_process = st.button(
+            "🚀 Bắt đầu xử lý dữ liệu & lên số Excel",
+            type="primary",
+            use_container_width=True,
+            disabled=(not uploaded_files),
+        )
+    with col_clear:
+        if st.button("🗑️ Xóa dữ liệu hiện tại để thêm mới", use_container_width=True, type="secondary"):
+            clear_all_data()
 
-    col_btn, _ = st.columns([1, 2])
-    with col_btn:
-        start_process = st.button("🚀 Bắt đầu xử lý dữ liệu & lên số Excel", type="primary", use_container_width=True)
+    if uploaded_files:
+        st.success(f"Đã nhận **{len(uploaded_files)}** tệp sẵn sàng xử lý.")
+else:
+    start_process = False
 
-    if start_process:
-        progress_bar = st.progress(0)
-        status_text = st.empty()
+# Xử lý khi người dùng bấm Bắt đầu
+if start_process and uploaded_files:
+    progress_bar = st.progress(0)
+    status_text = st.empty()
 
-        # Tạo thư mục làm việc tạm thời
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            tmp_path = Path(tmp_dir)
-            staged_files: list[Path] = []
+    # Tạo thư mục làm việc tạm thời
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        staged_files: list[Path] = []
 
-            status_text.text("Đang chuẩn bị và giải nén các tập tin tải lên...")
-            for idx, uf in enumerate(uploaded_files):
-                dest = tmp_path / uf.name
-                with open(dest, "wb") as f:
-                    f.write(uf.getbuffer())
+        status_text.text("Đang chuẩn bị và giải nén các tập tin tải lên...")
+        for idx, uf in enumerate(uploaded_files):
+            dest = tmp_path / uf.name
+            with open(dest, "wb") as f:
+                f.write(uf.getbuffer())
 
-                ext = dest.suffix.lower()
-                if ext in {".zip", ".rar"}:
-                    sub_extract = tmp_path / f"ext_{idx}"
-                    sub_extract.mkdir(parents=True, exist_ok=True)
-                    try:
-                        extracted = tax_engine.extract_archive(dest, sub_extract)
-                        staged_files.extend(extracted)
-                    except Exception as exc:
-                        st.warning(f"Không thể giải nén {dest.name}: {exc}")
-                elif ext in {".pdf", ".xml"}:
-                    staged_files.append(dest)
+            ext = dest.suffix.lower()
+            if ext in {".zip", ".rar"}:
+                sub_extract = tmp_path / f"ext_{idx}"
+                sub_extract.mkdir(parents=True, exist_ok=True)
+                try:
+                    extracted = tax_engine.extract_archive(dest, sub_extract)
+                    staged_files.extend(extracted)
+                except Exception as exc:
+                    st.warning(f"Không thể giải nén {dest.name}: {exc}")
+            elif ext in {".pdf", ".xml"}:
+                staged_files.append(dest)
 
-            progress_bar.progress(30)
-            status_text.text(f"Đang bóc tách số liệu từ {len(staged_files)} tờ khai...")
+        progress_bar.progress(30)
+        status_text.text(f"Đang bóc tách số liệu từ {len(staged_files)} tờ khai...")
 
-            log_messages = []
-            def web_logger(msg: str, msg_type: str = "info"):
-                log_messages.append((msg_type, msg))
+        log_messages = []
+        def web_logger(msg: str, msg_type: str = "info"):
+            log_messages.append((msg_type, msg))
 
-            # Chọn lọc tờ khai mới nhất
-            latest_decls, parse_errors = tax_engine.select_latest_declarations(
-                staged_files,
-                logger=web_logger,
-                period_mode=period_mode
-            )
+        # Chọn lọc tờ khai mới nhất
+        latest_decls, parse_errors = tax_engine.select_latest_declarations(
+            staged_files,
+            logger=web_logger,
+            period_mode=period_mode
+        )
 
-            progress_bar.progress(70)
-            status_text.text("Đang kết chuyển số liệu vào mẫu Excel...")
+        progress_bar.progress(70)
+        status_text.text("Đang kết chuyển số liệu vào mẫu Excel...")
 
-            if not latest_decls:
-                st.error("Không tìm thấy tờ khai hợp lệ nào trong các tệp đã tải lên.")
+        if not latest_decls:
+            st.error("Không tìm thấy tờ khai hợp lệ nào trong các tệp đã tải lên.")
+            st.session_state["processed_result"] = None
+        else:
+            template_file = Path("MẪU.xlsx")
+            if not template_file.exists():
+                st.error("Không tìm thấy file mẫu 'MẪU.xlsx' trên hệ thống máy chủ.")
+                st.session_state["processed_result"] = None
             else:
-                template_file = Path("MẪU.xlsx")
-                if not template_file.exists():
-                    st.error("Không tìm thấy file mẫu 'MẪU.xlsx' trên hệ thống máy chủ.")
-                else:
-                    output_file = tmp_path / "KET_QUA_TO_KHAI_THUE.xlsx"
-                    tax_engine.write_to_excel_openpyxl(
-                        template_file,
-                        output_file,
-                        latest_decls,
-                        parse_errors,
-                        logger=web_logger
-                    )
+                output_file = tmp_path / "KET_QUA_TO_KHAI_THUE.xlsx"
+                tax_engine.write_to_excel_openpyxl(
+                    template_file,
+                    output_file,
+                    latest_decls,
+                    parse_errors,
+                    logger=web_logger
+                )
 
-                    progress_bar.progress(100)
-                    status_text.text("Xử lý hoàn tất!")
-                    st.success("🎉 Xử lý và lập bảng tổng hợp số liệu thuế thành công!")
+                progress_bar.progress(100)
+                status_text.text("Xử lý hoàn tất!")
 
-                    # Thống kê nhanh
-                    c1, c2, c3, c4 = st.columns(4)
-                    vat_count = sum(1 for d in latest_decls if d.tax_type == tax_engine.TAX_VAT)
-                    pit_count = sum(1 for d in latest_decls if d.tax_type == tax_engine.TAX_PIT)
-                    cit_count = sum(1 for d in latest_decls if d.tax_type == tax_engine.TAX_CIT)
-                    fct_count = sum(1 for d in latest_decls if d.tax_type == tax_engine.TAX_FCT)
+                with open(output_file, "rb") as f:
+                    excel_data = f.read()
 
-                    with c1:
-                        st.metric("Thuế GTGT (01/GTGT)", f"{vat_count} kỳ")
-                    with c2:
-                        st.metric("Thuế TNCN (05/KK)", f"{pit_count} kỳ")
-                    with c3:
-                        st.metric("Quyết toán TNDN", f"{cit_count} kỳ")
-                    with c4:
-                        st.metric("Thuế NTNN (01/NTNN)", f"{fct_count} kỳ")
+                dfs = tax_engine.generate_summary_dataframes(latest_decls)
 
-                    # Nút tải file Excel
-                    with open(output_file, "rb") as f:
-                        excel_data = f.read()
+                # Lưu vào session_state để không bị mất khi bấm tải hoặc chuyển tab
+                st.session_state["processed_result"] = {
+                    "excel_data": excel_data,
+                    "latest_decls": latest_decls,
+                    "dfs": dfs,
+                    "log_messages": log_messages,
+                }
+                st.rerun()
 
-                    st.markdown("---")
-                    st.download_button(
-                        label="📥 TẢI FILE EXCEL KẾT QUẢ (KẾT QUẢ TỜ KHAI THUẾ.xlsx)",
-                        data=excel_data,
-                        file_name="KET_QUA_TO_KHAI_THUE.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        key="btn_download_excel",
-                    )
+# Hiển thị kết quả đã xử lý (nếu có trong session_state)
+if st.session_state["processed_result"] is not None:
+    res = st.session_state["processed_result"]
+    latest_decls = res["latest_decls"]
+    excel_data = res["excel_data"]
+    dfs = res["dfs"]
+    log_messages = res["log_messages"]
 
-                    # Bảng xem trước dữ liệu
-                    st.markdown("### 📊 Xem trước bảng số liệu đã bóc tách:")
-                    dfs = tax_engine.generate_summary_dataframes(latest_decls)
+    st.success("🎉 Xử lý và lập bảng tổng hợp số liệu thuế thành công!")
 
-                    tab_vat, tab_pit, tab_cit, tab_fct, tab_log = st.tabs([
-                        "📊 Thuế GTGT (E343)",
-                        "👤 Thuế TNCN (E350)",
-                        "🏢 Quyết toán TNDN (E382)",
-                        "🌍 Thuế NTNN (E370)",
-                        "📑 Nhật ký bóc tách",
-                    ])
+    # Thống kê nhanh
+    c1, c2, c3, c4 = st.columns(4)
+    vat_count = sum(1 for d in latest_decls if d.tax_type == tax_engine.TAX_VAT)
+    pit_count = sum(1 for d in latest_decls if d.tax_type == tax_engine.TAX_PIT)
+    cit_count = sum(1 for d in latest_decls if d.tax_type == tax_engine.TAX_CIT)
+    fct_count = sum(1 for d in latest_decls if d.tax_type == tax_engine.TAX_FCT)
 
-                    with tab_vat:
-                        st.dataframe(dfs["VAT"].style.format(precision=0, thousands=","), use_container_width=True)
+    with c1:
+        st.metric("Thuế GTGT (01/GTGT)", f"{vat_count} kỳ")
+    with c2:
+        st.metric("Thuế TNCN (05/KK)", f"{pit_count} kỳ")
+    with c3:
+        st.metric("Quyết toán TNDN", f"{cit_count} kỳ")
+    with c4:
+        st.metric("Thuế NTNN (01/NTNN)", f"{fct_count} kỳ")
 
-                    with tab_pit:
-                        st.dataframe(dfs["PIT"].style.format(precision=0, thousands=","), use_container_width=True)
+    # Nút tải file Excel
+    st.markdown("---")
+    col_dl, col_reset = st.columns([3, 1])
+    with col_dl:
+        st.download_button(
+            label="📥 TẢI FILE EXCEL KẾT QUẢ (KẾT QUẢ TỜ KHAI THUẾ.xlsx)",
+            data=excel_data,
+            file_name="KET_QUA_TO_KHAI_THUE.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="btn_download_excel",
+        )
+    with col_reset:
+        if st.button("🔄 Thêm đợt dữ liệu mới", use_container_width=True):
+            clear_all_data()
 
-                    with tab_cit:
-                        st.dataframe(dfs["CIT"].style.format(precision=0, thousands=","), use_container_width=True)
+    # Bảng xem trước dữ liệu
+    st.markdown("### 📊 Xem trước bảng số liệu đã bóc tách:")
 
-                    with tab_fct:
-                        st.dataframe(dfs["FCT"].style.format(precision=0, thousands=","), use_container_width=True)
+    tab_vat, tab_pit, tab_cit, tab_fct, tab_log = st.tabs([
+        "📊 Thuế GTGT (E343)",
+        "👤 Thuế TNCN (E350)",
+        "🏢 Quyết toán TNDN (E382)",
+        "🌍 Thuế NTNN (E370)",
+        "📑 Nhật ký bóc tách",
+    ])
 
-                    with tab_log:
-                        st.markdown("**Danh sách các tờ khai đã xử lý:**")
-                        for t, m in log_messages:
-                            if t == "success":
-                                st.success(m)
-                            elif t == "warning":
-                                st.warning(m)
-                            else:
-                                st.info(m)
+    with tab_vat:
+        st.dataframe(dfs["VAT"].style.format(precision=0, thousands=","), use_container_width=True)
+
+    with tab_pit:
+        st.dataframe(dfs["PIT"].style.format(precision=0, thousands=","), use_container_width=True)
+
+    with tab_cit:
+        st.dataframe(dfs["CIT"].style.format(precision=0, thousands=","), use_container_width=True)
+
+    with tab_fct:
+        st.dataframe(dfs["FCT"].style.format(precision=0, thousands=","), use_container_width=True)
+
+    with tab_log:
+        st.markdown("**Danh sách các tờ khai đã xử lý:**")
+        for t, m in log_messages:
+            if t == "success":
+                st.success(m)
+            elif t == "warning":
+                st.warning(m)
+            else:
+                st.info(m)
