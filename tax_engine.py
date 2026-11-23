@@ -188,19 +188,92 @@ def extract_revision(text: str, filename: str) -> int:
     return 0
 
 
+def is_non_declaration(text: str, filename: str) -> tuple[bool, str]:
+    """Kiểm tra xem tệp có phải là Giấy nộp tiền, Bảng kê nộp tiền, Thông báo thuế... chứ không phải Tờ khai thuế."""
+    fn = fold(filename)
+    payment_indicators = [
+        "ds_tien_nop", "dstiennop", "tien_nop", "tiennop",
+        "giay_nop_tien", "giaynoptien", "gnt",
+        "bang_ke_nop", "bangkenop", "chung_tu_nop", "chungtunop",
+        "nop_tien_thue", "noptienthue", "bien_lai", "bienlai",
+    ]
+    if any(k in fn for k in payment_indicators):
+        return True, "Giấy nộp tiền / Bảng kê nộp tiền vào NSNN (Không phải tờ khai thuế)"
+
+    notice_indicators = [
+        "thong_bao", "thongbao", "tb_tiep_nhan", "tb_chap_nhan", "tb_nop_thue",
+    ]
+    if any(k in fn for k in notice_indicators):
+        return True, "Thông báo từ cơ quan thuế (Không phải tờ khai thuế)"
+
+    src = fold(text[:4000])
+    if any(k in src for k in [
+        "giay nop tien vao ngan sach nha nuoc",
+        "giay nop tien vao nsnn",
+        "danh sach tien nop",
+        "bang ke nop thue",
+        "bang ke nop tien",
+        "chung tu nop tien vao nsnn",
+        "chung tu nop ngan sach",
+        "thong bao tiep nhan ho so khai thue",
+        "thong bao chap nhan ho so khai thue",
+        "thong bao nop thue",
+    ]):
+        return True, "Giấy nộp tiền / Chứng từ nộp thuế hoặc Thông báo thuế (Không phải tờ khai thuế)"
+
+    return False, ""
+
+
 def detect_tax_type(text: str) -> str | None:
     source = fold(text[:12000])
-    if "01/gtgt" in source or "gia tri gia tang" in source:
+    # 1. Thuế Giá trị gia tăng (01/GTGT)
+    if (
+        "01/gtgt" in source
+        or "01_gtgt" in source
+        or "01-gtgt" in source
+        or "to khai thue gia tri gia tang" in source
+        or ("gia tri gia tang" in source and any(c in source for c in ["[22]", "[24]", "[25]", "[43]"]))
+    ):
         return TAX_VAT
-    if "05/kk-tncn" in source or "02/kk-tncn" in source or ("05/kk-" in source and "thu nhap ca nhan" in source) or "thu nhap ca nhan" in source:
+
+    # 2. Thuế Thu nhập cá nhân (05/KK-TNCN, 02/KK-TNCN)
+    if (
+        "05/kk-tncn" in source
+        or "05_kk_tncn" in source
+        or "05-kk-tncn" in source
+        or "05/kk" in source
+        or "02/kk-tncn" in source
+        or "02_kk_tncn" in source
+        or "02-kk-tncn" in source
+        or "to khai khau tru thue thu nhap ca nhan" in source
+        or "to khai thue thu nhap ca nhan" in source
+        or ("thu nhap ca nhan" in source and any(c in source for c in ["[29]", "[30]", "[31]"]))
+    ):
         return TAX_PIT
-    if "01/ntnn" in source or "nha thau" in source:
+
+    # 3. Thuế Nhà thầu nước ngoài (01/NTNN)
+    if (
+        "01/ntnn" in source
+        or "01_ntnn" in source
+        or "01-ntnn" in source
+        or "to khai thue nha thau" in source
+        or "thue nha thau nuoc ngoai" in source
+    ):
         return TAX_FCT
-    if "03/tndn" in source or "03-tndn" in source or "03_tndn" in source or ("quyet toan" in source and "thu nhap doanh nghiep" in source) or "thu nhap doanh nghiep" in source:
+
+    # 4. Quyết toán thuế Thu nhập doanh nghiệp (03/TNDN)
+    if (
+        "03/tndn" in source
+        or "03_tndn" in source
+        or "03-tndn" in source
+        or "quyet toan thue thu nhap doanh nghiep" in source
+        or "to khai quyet toan thue thu nhap doanh nghiep" in source
+    ):
         return TAX_CIT
-    # Mặc định kiểm tra chỉ tiêu [43] hoặc [22]
-    if "[43]" in source or "[22]" in source or "[25]" in source:
+
+    if "[43]" in source and "[22]" in source:
         return TAX_VAT
+
     return None
 
 
@@ -464,6 +537,10 @@ def convert_image_to_pdf(image_path: Path, output_pdf_path: Path) -> Path:
 
 def read_scan_declaration(path: Path) -> Declaration:
     """Đọc tờ khai từ bản scan/ảnh qua OCR (RapidOCR)."""
+    non_decl, reason = is_non_declaration("", path.name)
+    if non_decl:
+        raise ValueError(reason)
+
     try:
         from tax_scan_ocr import scan_pages, ocr_pages_to_text, printed_pit_amounts
     except Exception as exc:
@@ -473,6 +550,10 @@ def read_scan_declaration(path: Path) -> Declaration:
     full_text = ocr_pages_to_text(pages)
     if not full_text.strip():
         raise ValueError("OCR: Không nhận diện được chữ hoặc số liệu từ bản scan/ảnh")
+
+    non_decl, reason = is_non_declaration(full_text, path.name)
+    if non_decl:
+        raise ValueError(reason)
 
     tax_type = detect_tax_type(full_text)
     if tax_type is None:
@@ -545,6 +626,10 @@ def read_scan_declaration(path: Path) -> Declaration:
 
 def read_pdf_declaration(path: Path) -> Declaration:
     """Đọc tờ khai từ file PDF kỹ thuật số (hoặc tự động chuyển fallback sang OCR nếu là bản scan)."""
+    non_decl, reason = is_non_declaration("", path.name)
+    if non_decl:
+        raise ValueError(reason)
+
     reader = PdfReader(str(path))
     if reader.is_encrypted:
         try:
@@ -566,6 +651,10 @@ def read_pdf_declaration(path: Path) -> Declaration:
     # Nếu văn bản quá ít (< 40 ký tự) -> Đây là file PDF scan/ảnh chụp -> Dùng bộ OCR
     if len(text.strip()) < 40:
         return read_scan_declaration(path)
+
+    non_decl, reason = is_non_declaration(text, path.name)
+    if non_decl:
+        raise ValueError(reason)
 
     tax_type = detect_tax_type(text)
     if tax_type is None:
@@ -657,6 +746,10 @@ def parse_xml_period_value(raw_period: str, is_quarterly: bool) -> tuple[int, in
 
 def read_xml_declaration(path: Path) -> Declaration:
     """Đọc tờ khai từ file XML chuẩn nộp Thuế điện tử eTax (Tổng cục Thuế)."""
+    non_decl, reason = is_non_declaration("", path.name)
+    if non_decl:
+        raise ValueError(reason)
+
     try:
         root = ET.parse(path).getroot()
     except ET.ParseError as exc:
@@ -669,6 +762,10 @@ def read_xml_declaration(path: Path) -> Declaration:
             fields.append((xml_local_name(element.tag), value))
 
     searchable = "\n".join(value for _, value in fields) + "\n" + path.name
+    non_decl, reason = is_non_declaration(searchable, path.name)
+    if non_decl:
+        raise ValueError(reason)
+
     tax_type = detect_tax_type(searchable)
     if tax_type is None:
         raise ValueError(f"Không phải XML tờ khai 01/GTGT, 05/KK-TNCN, 01/NTNN hoặc 03/TNDN: '{path.name}'")
@@ -801,6 +898,10 @@ def read_xml_declaration(path: Path) -> Declaration:
 
 def read_declaration_auto(path: Path) -> Declaration:
     """Tự động nhận diện định dạng tệp và bóc tách theo đúng ưu tiên."""
+    non_decl, reason = is_non_declaration("", path.name)
+    if non_decl:
+        raise ValueError(reason)
+
     ext = path.suffix.lower()
     if ext == ".xml":
         return read_xml_declaration(path)
@@ -892,16 +993,18 @@ def select_latest_declarations(
         except Exception as exc:
             err_msg = str(exc)
             errors.append((path.name, err_msg))
+            is_skipped_type = "Không phải tờ khai" in err_msg or "Bỏ qua" in err_msg
             audit_records.append({
                 "Tệp": path.name,
                 "Định dạng": path.suffix.upper().replace(".", ""),
-                "Loại tờ khai": "Chưa xác định",
+                "Loại tờ khai": "Giấy nộp tiền/Bảng kê" if is_skipped_type else "Chưa xác định",
                 "Kỳ thuế": "-",
                 "Lần nộp": "-",
-                "Trạng thái": "❌ Lỗi đọc",
+                "Trạng thái": "⏩ Bỏ qua" if is_skipped_type else "❌ Lỗi đọc",
                 "Ghi chú": err_msg,
             })
-            logger(f"⚠ Lỗi {path.name}: {err_msg}", "warning")
+            log_level = "info" if is_skipped_type else "warning"
+            logger(f"⚠ {path.name}: {err_msg}", log_level)
 
     # Áp dụng bộ lọc chọn lọc tối ưu
     latest: dict[tuple[str, int, int], Declaration] = {}
