@@ -6,6 +6,7 @@ Tương thích 100% với Streamlit Cloud và mạng nội bộ.
 Hỗ trợ ưu tiên: XML > PDF > Hình ảnh (PNG, JPG...) chuyển sang PDF/Scan.
 """
 
+import datetime
 import io
 import os
 import shutil
@@ -15,6 +16,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+import google_sheet_logger
 import tax_engine
 
 # Cấu hình giao diện Streamlit
@@ -31,6 +33,25 @@ if "uploader_key_id" not in st.session_state:
 
 if "processed_result" not in st.session_state:
     st.session_state["processed_result"] = None
+
+if "session_device_id" not in st.session_state:
+    st.session_state["session_device_id"] = f"TK-WEB-{os.urandom(3).hex().upper()}"
+
+# Lấy thông tin thiết bị và mạng của người dùng
+client_info = google_sheet_logger.get_client_info_from_streamlit()
+
+# Tự động ghi nhận máy tính đăng nhập vào Google Sheet (chỉ 1 lần mỗi phiên)
+if "session_logged" not in st.session_state:
+    st.session_state["session_logged"] = True
+    google_sheet_logger.log_device_async(
+        action="Đăng nhập hệ thống",
+        platform_type="Web Online (Streamlit)",
+        device_id=st.session_state["session_device_id"],
+        client_name=client_info.get("os_name", "Thiết bị Web"),
+        ip_address=client_info.get("ip", "127.0.0.1"),
+        user_agent=f"{client_info.get('os_name', 'Web')} | {client_info.get('browser', 'Trình duyệt')}",
+        note="Người dùng truy cập vào trang web",
+    )
 
 def clear_all_data():
     """Xóa sạch tệp đã tải lên và kết quả hiện tại để nạp đợt dữ liệu mới."""
@@ -145,6 +166,41 @@ with st.sidebar:
         index=0,
     )
 
+    st.markdown("---")
+    with st.expander("📊 Nhật ký Google Sheet", expanded=False):
+        current_sheet_url = google_sheet_logger.get_configured_sheet_url()
+        input_sheet_url = st.text_input(
+            "URL Google Apps Script:",
+            value=current_sheet_url,
+            placeholder="https://script.google.com/macros/s/.../exec",
+            help="Dán URL Web App Apps Script để tự động lưu nhật ký các máy tính đăng nhập vào Google Sheet.",
+        )
+        col_s1, col_s2 = st.columns([1, 1])
+        with col_s1:
+            if st.button("💾 Lưu URL", use_container_width=True):
+                google_sheet_logger.save_configured_sheet_url(input_sheet_url)
+                st.success("Đã lưu!")
+        with col_s2:
+            if st.button("⚡ Gửi thử", use_container_width=True):
+                if not input_sheet_url:
+                    st.warning("Chưa nhập URL.")
+                else:
+                    ok, msg = google_sheet_logger.send_log_payload({
+                        "timestamp": datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+                        "action": "Kiểm tra kết nối",
+                        "platform": "Web Online (Streamlit)",
+                        "device_id": st.session_state["session_device_id"],
+                        "client_name": client_info.get("os_name", "Thiết bị Web"),
+                        "ip": client_info.get("ip", "127.0.0.1"),
+                        "user_agent": f"{client_info.get('os_name', 'Web')} | {client_info.get('browser', 'Trình duyệt')}",
+                        "file_count": 0,
+                        "note": "Kiểm tra kết nối từ Admin",
+                    }, sheet_url=input_sheet_url)
+                    if ok:
+                        st.success("✔ Kết nối Google Sheet thành công!")
+                    else:
+                        st.error(f"Lỗi: {msg}")
+
 # Khu vực Upload tập tin có gắn key động để hỗ trợ Clear triệt để
 current_uploader_key = f"uploader_{st.session_state['uploader_key_id']}"
 uploaded_files = st.file_uploader(
@@ -176,6 +232,18 @@ else:
 
 # Xử lý khi người dùng bấm Bắt đầu
 if start_process and uploaded_files:
+    # Ghi nhận hành động bóc tách tờ khai vào Google Sheet ngầm
+    google_sheet_logger.log_device_async(
+        action="Bóc tách tờ khai thuế",
+        platform_type="Web Online (Streamlit)",
+        device_id=st.session_state.get("session_device_id", "WEB-CLIENT"),
+        client_name=client_info.get("os_name", "Thiết bị Web"),
+        ip_address=client_info.get("ip", "127.0.0.1"),
+        user_agent=f"{client_info.get('os_name', 'Web')} | {client_info.get('browser', 'Trình duyệt')}",
+        file_count=len(uploaded_files),
+        note=f"Đã tải lên {len(uploaded_files)} tệp để bóc tách",
+    )
+
     progress_bar = st.progress(0)
     status_text = st.empty()
 
