@@ -107,21 +107,29 @@ def parse_amount(raw: str) -> int:
 
 def extract_period(text: str, filename: str) -> tuple[int, int] | None:
     source = fold(text + "\n" + filename)
-    annual_patterns = [
-        r"ky\s*tinh\s*thue.{0,100}?nam\s*(20\d{2})",
-        r"nam\s*(20\d{2})\s*(?:tu\s*\d{1,2}/\d{1,2}/\d{4}\s*den|\(tu|tu\s*01/01/)",
+
+    # 1. Khai báo theo Tháng (Ưu tiên cao nhất)
+    month_patterns = [
+        r"ky\s*tinh\s*thue.{0,50}?thang\s*0?([1-9]|1[0-2])\s*(?:nam|/)?\s*(20\d{2})",
+        r"ky\s*tinh\s*thue.{0,50}?t0?([1-9]|1[0-2])\s*[-_./\s]*(20\d{2})",
+        r"thang\s*0?([1-9]|1[0-2])\s*(?:nam|/)\s*(20\d{2})",
+        r"ky\s*tinh\s*thue\s*:?\s*0?([1-9]|1[0-2])/(20\d{2})",
+        r"thang\s*0?([1-9]|1[0-2])\s*nam\s*(20\d{2})",
     ]
-    for pattern in annual_patterns:
+    for pattern in month_patterns:
         match = re.search(pattern, source, re.DOTALL)
         if match:
-            year = int(match.group(1))
-            return 12, year
+            month = int(match.group(1))
+            year = int(match.group(2))
+            if 1 <= month <= 12:
+                return month, year
 
+    # 2. Khai báo theo Quý
     quarter_patterns = [
-        r"(?:ky\s*tinh\s*thue.{0,100}?)?quy\s*([1-4])\s*(?:nam|/)?\s*(20\d{2})",
-        r"(?:ky\s*tinh\s*thue.{0,100}?)?quy\s*([iI]{1,3}|IV)\s*(?:nam|/)?\s*(20\d{2})",
-        r"(?:ky\s*tinh\s*thue.{0,100}?)?quy\s*([1-4])\s*ky\s*tinh\s*tu\s*thang\s*\d{1,2}/\s*(20\d{2})",
-        r"(?:ky\s*tinh\s*thue.{0,100}?)?q([1-4])\s*[-_./\s]*(20\d{2})",
+        r"(?:ky\s*tinh\s*thue.{0,50}?)?quy\s*([1-4])\s*(?:nam|/)?\s*(20\d{2})",
+        r"(?:ky\s*tinh\s*thue.{0,50}?)?quy\s*([iI]{1,3}|IV)\s*(?:nam|/)?\s*(20\d{2})",
+        r"(?:ky\s*tinh\s*thue.{0,50}?)?quy\s*([1-4])\s*ky\s*tinh\s*tu\s*thang\s*\d{1,2}/\s*(20\d{2})",
+        r"(?:ky\s*tinh\s*thue.{0,50}?)?q([1-4])\s*[-_./\s]*(20\d{2})",
     ]
     for pattern in quarter_patterns:
         match = re.search(pattern, source, re.DOTALL)
@@ -132,33 +140,36 @@ def extract_period(text: str, filename: str) -> tuple[int, int] | None:
             year = int(match.group(2))
             return quarter * 3, year
 
-    month_patterns = [
-        r"(?:ky\s*tinh\s*thue.{0,100}?)?thang\s*0?(\d{1,2})\s*(?:nam|/)?\s*(20\d{2})",
-        r"(?:ky\s*tinh\s*thue.{0,100}?)?t0?(\d{1,2})\s*[-_./\s]*(20\d{2})",
-        r"(?:ky\s*tinh\s*thue.{0,100}?)?0?(\d{1,2})/(20\d{2})",
-        r"thang\s*0?(\d{1,2})\s*nam\s*(20\d{2})",
-    ]
-    for pattern in month_patterns:
-        match = re.search(pattern, source, re.DOTALL)
-        if match:
-            month = int(match.group(1))
-            year = int(match.group(2))
-            if 1 <= month <= 12:
-                return month, year
-
-    fn_match = re.search(r"t0?(\d{1,2})[-_. ]*(20\d{2})", source)
+    # 3. Quét kỳ theo tên tệp (Filename)
+    fn_source = fold(filename)
+    fn_match = re.search(r"(?:thang|t)[-_.\s]*0?([1-9]|1[0-2])[-_.\s]+(20\d{2})", fn_source)
+    if not fn_match:
+        fn_match = re.search(r"t0?([1-9]|1[0-2])[-_.](20\d{2})", fn_source)
+    if not fn_match:
+        fn_match = re.search(r"[-_. ]0?([1-9]|1[0-2])\.(20\d{2})", fn_source)
     if fn_match:
         month = int(fn_match.group(1))
         year = int(fn_match.group(2))
         if 1 <= month <= 12:
             return month, year
 
-    fn_match2 = re.search(r"(?:thang|t)?[-_ ]?0?(\d{1,2})[-_. ]+(20\d{2})", source)
-    if fn_match2:
-        month = int(fn_match2.group(1))
-        year = int(fn_match2.group(2))
-        if 1 <= month <= 12:
-            return month, year
+    fn_quarter = re.search(r"(?:quy|q)[-_.\s]*([1-4])[-_.\s]+(20\d{2})", fn_source)
+    if fn_quarter:
+        quarter = int(fn_quarter.group(1))
+        year = int(fn_quarter.group(2))
+        return quarter * 3, year
+
+    # 4. Khai báo theo Năm (Chỉ xét khi không có Tháng và không có Quý)
+    annual_patterns = [
+        r"ky\s*tinh\s*thue\s*:?\s*nam\s*(20\d{2})",
+        r"nam\s*(20\d{2})\s*(?:tu\s*\d{1,2}/\d{1,2}/\d{4}\s*den|\(tu|tu\s*01/01/)",
+        r"ky\s*tinh\s*thue.{0,50}?nam\s*(20\d{2})",
+    ]
+    for pattern in annual_patterns:
+        match = re.search(pattern, source, re.DOTALL)
+        if match:
+            year = int(match.group(1))
+            return 12, year
 
     return None
 
@@ -230,21 +241,33 @@ def extract_indicators(text: str) -> tuple[dict[str, int], list[str]]:
 
 
 def extract_pit_indicator_29(text: str) -> int | None:
-    marker = re.compile(r"\[\s*29\s*\]", re.I)
-    amount_after_marker = re.compile(
-        r"^\s*(?:(?:VNĐ|VND|đồng)\s*)*"
-        r"(\(\s*(?:\d{1,3}(?:[.,]\d{3})+|\d+)\s*\)|"
-        r"-?\s*(?:\d{1,3}(?:[.,]\d{3})+|\d+))",
-        re.I,
-    )
-    for line in clean_pdf_text(text).splitlines():
-        matches = list(marker.finditer(line))
-        for index, match in enumerate(matches):
-            end = matches[index + 1].start() if index + 1 < len(matches) else len(line)
-            after = line[match.end():end]
-            value_match = amount_after_marker.match(after)
-            if value_match:
-                return parse_amount(value_match.group(1))
+    lines = clean_pdf_text(text).splitlines()
+    for i, line in enumerate(lines):
+        for m in re.finditer(r"\[\s*29\s*\](?!\s*=)", line):
+            after = line[m.end():]
+            amt_match = re.search(r"(?:vn[đd]|dong|[:\-])?\s*([(-]?\s*\d{1,3}(?:[.,]\d{3})+|-?\s*\d+)\b", after, re.I)
+            if amt_match:
+                try:
+                    return parse_amount(amt_match.group(1))
+                except Exception:
+                    pass
+        if re.search(r"\[\s*29\s*\](?!\s*=)\s*$", line):
+            if i + 1 < len(lines):
+                next_line = lines[i + 1]
+                amt_match = re.search(r"(?:vn[đd]|dong|[:\-])?\s*([(-]?\s*\d{1,3}(?:[.,]\d{3})+|-?\s*\d+)\b", next_line, re.I)
+                if amt_match:
+                    try:
+                        return parse_amount(amt_match.group(1))
+                    except Exception:
+                        pass
+
+    match = re.search(r"\[\s*29\s*\](?!\s*=)[^0-9\n]{0,30}?([(-]?\s*\d{1,3}(?:[.,]\d{3})+|-?\s*\d+)", text, re.I)
+    if match:
+        try:
+            return parse_amount(match.group(1))
+        except Exception:
+            pass
+
     return None
 
 
@@ -463,8 +486,9 @@ def read_scan_declaration(path: Path) -> Declaration:
         raise ValueError("OCR: Không xác định được tháng/quý/năm kê khai từ bản scan/ảnh")
 
     period_source = fold(full_text + "\n" + path.name)
-    is_quarterly = bool(re.search(r"(?:ky\s*tinh\s*thue.{0,100}?)?quy\s*[1-4]", period_source, re.DOTALL))
-    is_annual = (tax_type == TAX_CIT) or bool(re.search(r"ky\s*tinh\s*thue.{0,100}?nam\s*20\d{2}", period_source, re.DOTALL))
+    has_month = bool(re.search(r"thang\s*0?([1-9]|1[0-2])", period_source)) or bool(re.search(r"\bt0?([1-9]|1[0-2])\b", period_source))
+    is_quarterly = not has_month and bool(re.search(r"(?:ky\s*tinh\s*thue.{0,50}?)?quy\s*([1-4]|iv|iii|ii|i)", period_source, re.DOTALL))
+    is_annual = not has_month and not is_quarterly and ((tax_type == TAX_CIT) or bool(re.search(r"ky\s*tinh\s*thue\s*:?\s*nam\s*20\d{2}", period_source, re.DOTALL)))
     revision = extract_revision(full_text, path.name)
     period_type = "year" if is_annual else ("quarter" if is_quarterly else "month")
 
@@ -555,8 +579,9 @@ def read_pdf_declaration(path: Path) -> Declaration:
             raise ValueError(f"Không nhận diện được loại tờ khai thuế hợp lệ trong file '{path.name}'")
 
     period_source = fold(text + "\n" + path.name)
-    is_quarterly = bool(re.search(r"(?:ky\s*tinh\s*thue.{0,100}?)?quy\s*[1-4]", period_source, re.DOTALL))
-    is_annual = (tax_type == TAX_CIT) or bool(re.search(r"ky\s*tinh\s*thue.{0,100}?nam\s*20\d{2}", period_source, re.DOTALL))
+    has_month = bool(re.search(r"thang\s*0?([1-9]|1[0-2])", period_source)) or bool(re.search(r"\bt0?([1-9]|1[0-2])\b", period_source))
+    is_quarterly = not has_month and bool(re.search(r"(?:ky\s*tinh\s*thue.{0,50}?)?quy\s*([1-4]|iv|iii|ii|i)", period_source, re.DOTALL))
+    is_annual = not has_month and not is_quarterly and ((tax_type == TAX_CIT) or bool(re.search(r"ky\s*tinh\s*thue\s*:?\s*nam\s*20\d{2}", period_source, re.DOTALL)))
     period = extract_period(text, path.name)
     if not period:
         raise ValueError(f"Không xác định được tháng/quý/năm kê khai trong file '{path.name}'")
@@ -570,6 +595,13 @@ def read_pdf_declaration(path: Path) -> Declaration:
         pit_value = extract_pit_indicator_29(layout_text)
         if pit_value is None:
             pit_value = extract_pit_indicator_29(text)
+        if pit_value is None:
+            try:
+                scan_decl = read_scan_declaration(path)
+                if "29" in scan_decl.values and scan_decl.values["29"] is not None:
+                    pit_value = scan_decl.values["29"]
+            except Exception:
+                pass
         values = {"29": pit_value} if pit_value is not None else {}
         missing = [] if pit_value is not None else ["29"]
     elif tax_type == TAX_CIT:
