@@ -175,17 +175,28 @@ def extract_period(text: str, filename: str) -> tuple[int, int] | None:
 
 
 def extract_revision(text: str, filename: str) -> int:
-    source = fold(text + "\n" + filename)
-    match = re.search(r"bo\s*sung\s*lan\s*(?:thu\s*)?(\d+)", source)
-    if match:
-        return int(match.group(1))
-    fn_match = re.search(r"(?:lan\s*|l)(\d+)", fold(filename))
-    if fn_match and "lan dau" not in source:
-        try:
-            return int(fn_match.group(1))
-        except ValueError:
-            pass
-    return 0
+    source = fold(text)
+    rev = 0
+    for pattern in [
+        r"bo\s*sung\s*lan\s*(?:thu\s*)?[:\[\(\s]*(\d+)",
+        r"lan\s*bo\s*sung\s*[:\[\(\s]*(\d+)",
+    ]:
+        match = re.search(pattern, source)
+        if match:
+            rev = max(rev, int(match.group(1)))
+
+    fn = fold(filename)
+    for pattern in [
+        r"(?:bo\s*sung|bs)[-_.\s]*(?:lan[-_.\s]*(?:thu[-_.\s]*)?|l[-_.\s]*)?(\d+)\b",
+        r"(?:^|[-_.\s])(?:lan|l)[-_.\s]*0*(\d+)\b",
+    ]:
+        fn_match = re.search(pattern, fn)
+        if fn_match:
+            try:
+                rev = max(rev, int(fn_match.group(1)))
+            except ValueError:
+                pass
+    return rev
 
 
 def is_non_declaration(text: str, filename: str) -> tuple[bool, str]:
